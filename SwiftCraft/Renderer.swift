@@ -8,33 +8,20 @@ class Renderer: NSObject, MTKViewDelegate {
     let pipelineState: MTLRenderPipelineState
     let depthStencilState: MTLDepthStencilState
     
-    // 1. 定义两个 Buffer：一个存顶点，一个存索引
-    let vertexBuffer: MTLBuffer
-    let indexBuffer: MTLBuffer
+    // 纹理图集
+    let atlasTexture: MTLTexture
     
-    var rotation: Float = 0
+    // 摄像机引用
+    var camera: Camera?
     
-    // --- 顶点数据：立方体的 8 个角 ---
-    let cubeVertices: [Vertex] = [
-        Vertex(position: [-0.5, -0.5,  0.5], color: [1, 0, 0, 1]), // 0: 左下前
-        Vertex(position: [ 0.5, -0.5,  0.5], color: [0, 1, 0, 1]), // 1: 右下前
-        Vertex(position: [ 0.5,  0.5,  0.5], color: [0, 0, 1, 1]), // 2: 右上前
-        Vertex(position: [-0.5,  0.5,  0.5], color: [1, 1, 0, 1]), // 3: 左上前
-        Vertex(position: [-0.5, -0.5, -0.5], color: [1, 0, 1, 1]), // 4: 左下后
-        Vertex(position: [ 0.5, -0.5, -0.5], color: [0, 1, 1, 1]), // 5: 右下后
-        Vertex(position: [ 0.5,  0.5, -0.5], color: [1, 1, 1, 1]), // 6: 右上后
-        Vertex(position: [-0.5,  0.5, -0.5], color: [0, 0, 0, 1])  // 7: 左上后
-    ]
+    // --- 新增：逻辑更新回调 ---
+    var onUpdate: (() -> Void)?
     
-    // --- 索引数据：定义 12 个三角形的连接顺序 ---
-    let cubeIndices: [UInt16] = [
-        0, 1, 2,  0, 2, 3, // 前面
-        4, 6, 5,  4, 7, 6, // 后面
-        4, 0, 3,  4, 3, 7, // 左面
-        1, 5, 6,  1, 6, 2, // 右面
-        3, 2, 6,  3, 6, 7, // 上面
-        4, 5, 1,  4, 1, 0  // 下面
-    ]
+    // 动态生成的顶点 Buffer
+    var vertexBuffer: MTLBuffer?
+    var vertexCount: Int = 0
+    
+    let chunk = Chunk() // 5x5x5 的地形数据
 
     init?(metalKitView: MTKView) {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -44,87 +31,101 @@ class Renderer: NSObject, MTKViewDelegate {
         
         metalKitView.device = device
         metalKitView.depthStencilPixelFormat = .depth32Float
-        metalKitView.clearColor = MTLClearColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 1.0)
+        // 天空蓝背景
+        metalKitView.clearColor = MTLClearColor(red: 0.5, green: 0.8, blue: 1.0, alpha: 1.0)
 
-        // 2. 加载 Shader
-        let library = device.makeDefaultLibrary()
-        let vertexFunction = library?.makeFunction(name: "vertex_main")
-        let fragmentFunction = library?.makeFunction(name: "fragment_main")
-
-        // 3. 配置管线
-        let pipelineDescriptor = MTLRenderPipelineDescriptor()
-        pipelineDescriptor.vertexFunction = vertexFunction
-        pipelineDescriptor.fragmentFunction = fragmentFunction
-        pipelineDescriptor.colorAttachments[0].pixelFormat = metalKitView.colorPixelFormat
-        pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
-
+        // 1. 加载图集
+        let textureLoader = MTKTextureLoader(device: device)
         do {
-            pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+            let options: [MTKTextureLoader.Option: Any] = [
+                .SRGB: false,
+                .generateMipmaps: true // 生成多级渐远纹理，远处不闪烁
+            ]
+            // 请确保 Assets 中有名为 "terrain_atlas" 的图片
+            atlasTexture = try textureLoader.newTexture(name: "terrain_atlas", scaleFactor: 1.0, bundle: nil, options: options)
         } catch {
-            print("Pipeline Error: \(error)")
+            print("图集加载失败: \(error)")
             return nil
         }
 
-        // 4. 配置深度测试
-        let depthDescriptor = MTLDepthStencilDescriptor()
-        depthDescriptor.depthCompareFunction = .less
-        depthDescriptor.isDepthWriteEnabled = true
-        depthStencilState = device.makeDepthStencilState(descriptor: depthDescriptor)!
-
-        // 5. 创建 Buffer
-        // 顶点 Buffer
-        vertexBuffer = device.makeBuffer(bytes: cubeVertices,
-                                        length: cubeVertices.count * MemoryLayout<Vertex>.stride,
-                                        options: [])!
+        // 2. 生成区块网格
+        let vertices = GeometryFactory.generateChunkMesh(chunk: chunk)
+        self.vertexCount = vertices.count
         
-        // 索引 Buffer
-        indexBuffer = device.makeBuffer(bytes: cubeIndices,
-                                       length: cubeIndices.count * MemoryLayout<UInt16>.size,
-                                       options: [])!
+        if vertexCount > 0 {
+            vertexBuffer = device.makeBuffer(bytes: vertices,
+                                            length: vertices.count * MemoryLayout<Vertex>.stride,
+                                            options: [])
+        }
+
+        // 3. 配置管线
+        let library = device.makeDefaultLibrary()
+        let pipelineDescriptor = MTLRenderPipelineDescriptor()
+        pipelineDescriptor.vertexFunction = library?.makeFunction(name: "vertex_main")
+        pipelineDescriptor.fragmentFunction = library?.makeFunction(name: "fragment_main")
+        pipelineDescriptor.colorAttachments[0].pixelFormat = metalKitView.colorPixelFormat
+        pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
+        
+        // 修正绕序：由于之前手动调整了顶点，这里使用 CounterClockwise + Back 剔除
+        pipelineState = try! device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+
+        // 4. 深度测试配置
+        let depthDesc = MTLDepthStencilDescriptor()
+        depthDesc.depthCompareFunction = .less
+        depthDesc.isDepthWriteEnabled = true
+        depthStencilState = device.makeDepthStencilState(descriptor: depthDesc)!
 
         super.init()
     }
 
     func draw(in view: MTKView) {
+        // --- 核心：每一帧开始渲染前，先执行逻辑更新（处理 WASD/Shift 移动） ---
+        onUpdate?()
+        
+        // 确保资源就绪
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let descriptor = view.currentRenderPassDescriptor,
-              let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
-
-        rotation += 0.02
+              let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor),
+              let vBuffer = vertexBuffer,
+              let currentCamera = camera else { return }
         
-        // 计算矩阵 (确保你的 Math.swift 已经包含相关的扩展)
-        let projection = matrix_float4x4.perspective(
+        // 1. 获取投影矩阵
+        let aspectRatio = Float(view.drawableSize.width / view.drawableSize.height)
+        let projectionMatrix = matrix_float4x4.perspective(
             degrees: 45,
-            aspectRatio: Float(view.drawableSize.width / view.drawableSize.height),
+            aspectRatio: aspectRatio,
             near: 0.1,
             far: 100
         )
-        let viewMatrix = matrix_float4x4.translation(0, 0, -4)
-        let modelMatrix = matrix_float4x4.rotation(radians: rotation, axis: [1, 1, 0])
         
-        var uniforms = Uniforms(modelViewProjectionMatrix: projection * viewMatrix * modelMatrix)
-
-        // 设置绘制状态
+        // 2. 从 Camera 获取当前的视图矩阵
+        let viewMatrix = currentCamera.getViewMatrix()
+        
+        // 3. 模型矩阵：将 5x5x5 的区块中心移到世界原点附近，方便观察
+        let modelMatrix = matrix_float4x4.translation(-2.5, -2.5, -2.5)
+        
+        // 4. 合并 MVP 矩阵传递给 Shader
+        var uniforms = Uniforms(modelViewProjectionMatrix: projectionMatrix * viewMatrix * modelMatrix)
+        
+        // --- 执行渲染指令 ---
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setDepthStencilState(depthStencilState)
         
-        // 绑定顶点数据
-        renderEncoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+        // 使用背面剔除
+        renderEncoder.setCullMode(.back)
+        renderEncoder.setFrontFacing(.counterClockwise)
         
-        // 绑定矩阵数据
+        renderEncoder.setVertexBuffer(vBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+        renderEncoder.setFragmentTexture(atlasTexture, index: 0)
         
-        // --- 核心变化：使用索引绘制 ---
-        renderEncoder.drawIndexedPrimitives(type: .triangle,
-                                          indexCount: cubeIndices.count,
-                                          indexType: .uint16,
-                                          indexBuffer: indexBuffer,
-                                          indexBufferOffset: 0)
+        // 绘制
+        renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
         
         renderEncoder.endEncoding()
         commandBuffer.present(view.currentDrawable!)
         commandBuffer.commit()
     }
-
+    
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 }

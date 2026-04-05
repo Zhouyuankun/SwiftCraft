@@ -9,7 +9,7 @@ import simd
 
 struct Vertex {
     var position: simd_float3
-    var color: simd_float4
+    var texCoord: simd_float2 // 必须同步更新，且 Shader 里也要改
 }
 
 struct Uniforms {
