@@ -7,6 +7,10 @@ class Renderer: NSObject, MTKViewDelegate {
     let commandQueue: MTLCommandQueue
     let pipelineState: MTLRenderPipelineState
     let depthStencilState: MTLDepthStencilState
+
+    // 天空渐变管线
+    let skyPipelineState: MTLRenderPipelineState
+    let skyDepthStencilState: MTLDepthStencilState
     
     // 纹理图集
     let atlasTexture: MTLTexture
@@ -75,6 +79,20 @@ class Renderer: NSObject, MTKViewDelegate {
         depthDesc.isDepthWriteEnabled = true
         depthStencilState = device.makeDepthStencilState(descriptor: depthDesc)!
 
+        // 5. 天空渐变管线（顶点着色器内部生成全屏三角形，无需顶点缓冲区）
+        let skyDescriptor = MTLRenderPipelineDescriptor()
+        skyDescriptor.vertexFunction = library?.makeFunction(name: "sky_vertex")
+        skyDescriptor.fragmentFunction = library?.makeFunction(name: "sky_fragment")
+        skyDescriptor.colorAttachments[0].pixelFormat = metalKitView.colorPixelFormat
+        skyDescriptor.depthAttachmentPixelFormat = .depth32Float
+        skyPipelineState = try! device.makeRenderPipelineState(descriptor: skyDescriptor)
+
+        // 天空的深度状态：不写深度（保证不遮挡地形），lessEqual 让贴在远裁剪面上的天空通过测试
+        let skyDepthDesc = MTLDepthStencilDescriptor()
+        skyDepthDesc.depthCompareFunction = .lessEqual
+        skyDepthDesc.isDepthWriteEnabled = false
+        skyDepthStencilState = device.makeDepthStencilState(descriptor: skyDepthDesc)!
+
         super.init()
     }
 
@@ -97,28 +115,40 @@ class Renderer: NSObject, MTKViewDelegate {
             near: 0.1,
             far: 100
         )
-        
+
         // 2. 从 Camera 获取当前的视图矩阵
         let viewMatrix = currentCamera.getViewMatrix()
-        
+
+        // --- 第一步：绘制天空渐变（先画天空，让它垫在地形后面） ---
+        var skyUniforms = SkyUniforms(
+            invViewProj: (projectionMatrix * viewMatrix).inverse,
+            cameraPos: currentCamera.position
+        )
+        renderEncoder.setRenderPipelineState(skyPipelineState)
+        renderEncoder.setDepthStencilState(skyDepthStencilState)
+        renderEncoder.setCullMode(.none)
+        renderEncoder.setFragmentBytes(&skyUniforms, length: MemoryLayout<SkyUniforms>.stride, index: 1)
+        renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+
+        // --- 第二步：绘制地形 ---
         // 3. 模型矩阵：将 5x5x5 的区块中心移到世界原点附近，方便观察
         let modelMatrix = matrix_float4x4.translation(-2.5, -2.5, -2.5)
-        
+
         // 4. 合并 MVP 矩阵传递给 Shader
         var uniforms = Uniforms(modelViewProjectionMatrix: projectionMatrix * viewMatrix * modelMatrix)
-        
+
         // --- 执行渲染指令 ---
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setDepthStencilState(depthStencilState)
-        
+
         // 使用背面剔除
         renderEncoder.setCullMode(.back)
         renderEncoder.setFrontFacing(.counterClockwise)
-        
+
         renderEncoder.setVertexBuffer(vBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
         renderEncoder.setFragmentTexture(atlasTexture, index: 0)
-        
+
         // 绘制
         renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
         
