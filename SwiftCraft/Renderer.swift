@@ -20,19 +20,17 @@ class Renderer: NSObject, MTKViewDelegate {
     
     // --- 新增：逻辑更新回调 ---
     var onUpdate: (() -> Void)?
-    
-    // 动态生成的顶点 Buffer
-    var vertexBuffer: MTLBuffer?
-    var vertexCount: Int = 0
-    
-    let chunk = Chunk() // 5x5x5 的地形数据
+
+    // 多区块世界：负责区块的动态加载/卸载
+    let world: World
 
     init?(metalKitView: MTKView) {
         guard let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue() else { return nil }
         self.device = device
         self.commandQueue = commandQueue
-        
+        self.world = World(device: device)
+
         metalKitView.device = device
         metalKitView.depthStencilPixelFormat = .depth32Float
         // 天空蓝背景
@@ -52,17 +50,7 @@ class Renderer: NSObject, MTKViewDelegate {
             return nil
         }
 
-        // 2. 生成区块网格
-        let vertices = GeometryFactory.generateChunkMesh(chunk: chunk)
-        self.vertexCount = vertices.count
-        
-        if vertexCount > 0 {
-            vertexBuffer = device.makeBuffer(bytes: vertices,
-                                            length: vertices.count * MemoryLayout<Vertex>.stride,
-                                            options: [])
-        }
-
-        // 3. 配置管线
+        // 2. 配置管线
         let library = device.makeDefaultLibrary()
         let pipelineDescriptor = MTLRenderPipelineDescriptor()
         pipelineDescriptor.vertexFunction = library?.makeFunction(name: "vertex_main")
@@ -104,9 +92,8 @@ class Renderer: NSObject, MTKViewDelegate {
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let descriptor = view.currentRenderPassDescriptor,
               let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor),
-              let vBuffer = vertexBuffer,
               let currentCamera = camera else { return }
-        
+
         // 1. 获取投影矩阵
         let aspectRatio = Float(view.drawableSize.width / view.drawableSize.height)
         let projectionMatrix = matrix_float4x4.perspective(
@@ -130,14 +117,14 @@ class Renderer: NSObject, MTKViewDelegate {
         renderEncoder.setFragmentBytes(&skyUniforms, length: MemoryLayout<SkyUniforms>.stride, index: 1)
         renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
 
-        // --- 第二步：绘制地形 ---
-        // 3. 模型矩阵：将 5x5x5 的区块中心移到世界原点附近，方便观察
-        let modelMatrix = matrix_float4x4.translation(-2.5, -2.5, -2.5)
+        // --- 第二步：绘制地形（多区块流式加载） ---
+        // 计算相机当前所在的区块，动态加载渲染距离内的区块、卸载超出的区块
+        let centerChunk = World.worldToChunkCoord(currentCamera.position)
+        world.update(center: centerChunk)
 
-        // 4. 合并 MVP 矩阵传递给 Shader
-        var uniforms = Uniforms(modelViewProjectionMatrix: projectionMatrix * viewMatrix * modelMatrix)
+        // 合并 VP 矩阵（区块顶点已是世界坐标，模型矩阵为单位阵）
+        var uniforms = Uniforms(modelViewProjectionMatrix: projectionMatrix * viewMatrix)
 
-        // --- 执行渲染指令 ---
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setDepthStencilState(depthStencilState)
 
@@ -145,13 +132,15 @@ class Renderer: NSObject, MTKViewDelegate {
         renderEncoder.setCullMode(.back)
         renderEncoder.setFrontFacing(.counterClockwise)
 
-        renderEncoder.setVertexBuffer(vBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
         renderEncoder.setFragmentTexture(atlasTexture, index: 0)
 
-        // 绘制
-        renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
-        
+        // 逐个绘制所有已加载的区块
+        for (_, mesh) in world.loadedChunks {
+            renderEncoder.setVertexBuffer(mesh.buffer, offset: 0, index: 0)
+            renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: mesh.vertexCount)
+        }
+
         renderEncoder.endEncoding()
         commandBuffer.present(view.currentDrawable!)
         commandBuffer.commit()

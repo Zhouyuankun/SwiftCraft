@@ -16,9 +16,14 @@ let kVK_Escape: UInt16 = 53
 class GameViewController: NSViewController {
     var renderer: Renderer?
     var camera = Camera()
-    
+
     // 状态位：控制是否处于“游戏操作模式”
     var isCursorLocked = false
+
+    // --- HUD：屏幕右上角显示绝对位置、朝向和区块编号 ---
+    private var positionLabel: NSTextField!
+    private var facingLabel: NSTextField!
+    private var chunkLabel: NSTextField!
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -32,15 +37,19 @@ class GameViewController: NSViewController {
         // 2. 传递 Camera 引用
         newRenderer?.camera = self.camera
         
-        // 3. 核心：绑定每一帧的逻辑更新（只有锁定状态下才更新相机位置）
+        // 3. 核心：绑定每一帧的逻辑更新（只有锁定状态下才更新相机位置，HUD 每帧刷新）
         newRenderer?.onUpdate = { [weak self] in
             guard let self = self else { return }
             if self.isCursorLocked {
                 self.updateCamera()
             }
+            self.updateHUD()
         }
-        
-        // 4. 监听鼠标点击以锁定光标
+
+        // 4. 初始化屏幕右上角的坐标 HUD
+        setupHUD()
+
+        // 5. 监听鼠标点击以锁定光标
         NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
             guard let self = self else { return event }
             
@@ -152,5 +161,73 @@ class GameViewController: NSViewController {
         
         if activeKeys.contains(kVK_Space) { camera.position.y += speed }
         if activeKeys.contains(kVK_Shift) { camera.position.y -= speed }
+    }
+
+    // --- HUD 逻辑 ---
+
+    private func setupHUD() {
+        positionLabel = GameViewController.makeHUDLabel()
+        facingLabel = GameViewController.makeHUDLabel()
+        chunkLabel = GameViewController.makeHUDLabel()
+
+        view.addSubview(positionLabel)
+        view.addSubview(facingLabel)
+        view.addSubview(chunkLabel)
+
+        NSLayoutConstraint.activate([
+            positionLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
+            positionLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+
+            facingLabel.topAnchor.constraint(equalTo: positionLabel.bottomAnchor, constant: 2),
+            facingLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+
+            chunkLabel.topAnchor.constraint(equalTo: facingLabel.bottomAnchor, constant: 2),
+            chunkLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
+        ])
+    }
+
+    private static func makeHUDLabel() -> NSTextField {
+        let label = NSTextField()
+        label.isEditable = false
+        label.isBordered = false
+        label.drawsBackground = false
+        label.textColor = .white
+        label.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .semibold)
+        label.alignment = .right
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }
+
+    func updateHUD() {
+        let p = camera.position
+        let chunk = World.worldToChunkCoord(p)
+
+        let posText = String(format: "Position  (%.1f, %.1f, %.1f)", p.x, p.y, p.z)
+        let facingText = "Facing  \(facingText())"
+        let chunkText = "Chunk  (\(chunk.x), \(chunk.z))"
+
+        // 只在内容变化时更新，避免无谓的重绘
+        if positionLabel.stringValue != posText { positionLabel.stringValue = posText }
+        if facingLabel.stringValue != facingText { facingLabel.stringValue = facingText }
+        if chunkLabel.stringValue != chunkText { chunkLabel.stringValue = chunkText }
+    }
+
+    /// 计算朝向文本。
+    /// 水平前进方向由 yaw 决定：forward = (cos(yaw), 0, sin(yaw))。
+    /// 返回向前走时会增大的坐标轴及其符号，例如 "+X+Z" 表示向前走时 X、Z 都增大。
+    private func facingText() -> String {
+        let yawRad = camera.yaw.radians
+        let fx = cos(yawRad) // 前进方向的 X 分量
+        let fz = sin(yawRad) // 前进方向的 Z 分量
+
+        // 阈值：分量接近 0（正对坐标轴方向）时省略该轴，避免符号抖动
+        let threshold: Float = 0.01
+        var text = ""
+        if fx > threshold { text += "+X" }
+        else if fx < -threshold { text += "-X" }
+        if fz > threshold { text += "+Z" }
+        else if fz < -threshold { text += "-Z" }
+
+        return text.isEmpty ? "·" : text
     }
 }
