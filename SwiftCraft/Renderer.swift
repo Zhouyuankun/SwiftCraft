@@ -17,6 +17,10 @@ class Renderer: NSObject, MTKViewDelegate {
     
     // 摄像机引用
     var camera: Camera?
+
+    // 当前被屏幕中心准心选中的方块类型；未命中时为 air
+    private(set) var targetedBlockType: BlockType = .air
+    private var targetedBlock: BlockCoord?
     
     // --- 新增：逻辑更新回调 ---
     var onUpdate: (() -> Void)?
@@ -123,11 +127,16 @@ class Renderer: NSObject, MTKViewDelegate {
         world.update(center: centerChunk)
 
         // 从屏幕中心（相机前向）选取 6 格内的第一个实心方块。
-        let targetedBlock = world.raycast(
+        targetedBlock = world.raycast(
             origin: currentCamera.position,
             direction: currentCamera.lookAt,
             maxDistance: 6
         )
+        if let target = targetedBlock {
+            targetedBlockType = world.blockAtWorld(x: target.x, y: target.y, z: target.z) ?? .air
+        } else {
+            targetedBlockType = .air
+        }
 
         // 合并 VP 矩阵（区块顶点已是世界坐标，模型矩阵为单位阵）
         var uniforms = Uniforms(modelViewProjectionMatrix: projectionMatrix * viewMatrix)
@@ -166,6 +175,15 @@ class Renderer: NSObject, MTKViewDelegate {
         renderEncoder.endEncoding()
         commandBuffer.present(view.currentDrawable!)
         commandBuffer.commit()
+    }
+
+    /// 删除准心当前选中的方块。实际数据由 World 持久保存并负责重建相关网格。
+    func removeTargetedBlock() {
+        guard let target = targetedBlock else { return }
+        if world.removeBlock(at: target) {
+            targetedBlock = nil
+            targetedBlockType = .air
+        }
     }
     
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}

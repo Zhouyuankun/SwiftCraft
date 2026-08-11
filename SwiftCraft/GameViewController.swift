@@ -24,6 +24,7 @@ class GameViewController: NSViewController {
     private var positionLabel: NSTextField!
     private var facingLabel: NSTextField!
     private var chunkLabel: NSTextField!
+    private var blockLabel: NSTextField!
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -54,10 +55,14 @@ class GameViewController: NSViewController {
         NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
             guard let self = self else { return event }
             
-            // 如果点击在视图内，且当前还没锁定，则进入锁定模式
+            // 第一次点击进入锁定模式；锁定后的左键用于破坏准心选中的方块。
             let location = event.locationInWindow
-            if self.view.hitTest(location) != nil && !self.isCursorLocked {
-                self.lockCursor()
+            if self.view.hitTest(location) != nil {
+                if self.isCursorLocked {
+                    self.renderer?.removeTargetedBlock()
+                } else {
+                    self.lockCursor()
+                }
             }
             return event
         }
@@ -170,10 +175,12 @@ class GameViewController: NSViewController {
         positionLabel = GameViewController.makeHUDLabel()
         facingLabel = GameViewController.makeHUDLabel()
         chunkLabel = GameViewController.makeHUDLabel()
+        blockLabel = GameViewController.makeHUDLabel()
 
         view.addSubview(positionLabel)
         view.addSubview(facingLabel)
         view.addSubview(chunkLabel)
+        view.addSubview(blockLabel)
 
         NSLayoutConstraint.activate([
             positionLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
@@ -183,7 +190,10 @@ class GameViewController: NSViewController {
             facingLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
 
             chunkLabel.topAnchor.constraint(equalTo: facingLabel.bottomAnchor, constant: 2),
-            chunkLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
+            chunkLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+
+            blockLabel.topAnchor.constraint(equalTo: chunkLabel.bottomAnchor, constant: 2),
+            blockLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
         ])
     }
 
@@ -237,11 +247,14 @@ class GameViewController: NSViewController {
         let posText = String(format: "Position  (%.1f, %.1f, %.1f)", p.x, p.y, p.z)
         let facingText = "Facing  \(facingText())"
         let chunkText = "Chunk  (\(chunk.x), \(chunk.z))"
+        let targetedBlockType = renderer?.targetedBlockType ?? .air
+        let blockText = "Block  \(String(describing: targetedBlockType))"
 
         // 只在内容变化时更新，避免无谓的重绘
         if positionLabel.stringValue != posText { positionLabel.stringValue = posText }
         if facingLabel.stringValue != facingText { facingLabel.stringValue = facingText }
         if chunkLabel.stringValue != chunkText { chunkLabel.stringValue = chunkText }
+        if blockLabel.stringValue != blockText { blockLabel.stringValue = blockText }
     }
 
     /// 计算朝向文本。

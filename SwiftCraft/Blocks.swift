@@ -103,6 +103,9 @@ class World {
     /// 渲染距离内已加载并上传 GPU 的区块：ChunkCoord -> ChunkMesh
     private(set) var loadedChunks: [ChunkCoord: ChunkMesh] = [:]
 
+    /// 当前处于渲染距离内的区块坐标。单个区块即使被挖空、没有网格，也仍算已加载。
+    private var loadedChunkCoords: Set<ChunkCoord> = []
+
     /// Metal 设备，用于创建顶点缓冲
     private let device: MTLDevice
 
@@ -132,7 +135,7 @@ class World {
         }
 
         // 若需要的区块集合和当前已加载的完全一致，直接跳过
-        if needed == Set(loadedChunks.keys) {
+        if needed == loadedChunkCoords {
             return
         }
 
@@ -151,10 +154,10 @@ class World {
         //    - 邻居中有"刚生成"的区块时也要重建：之前该侧没有邻居、边界面被保留，
         //      现在邻居出现了，那些面应当被剔除
         for coord in needed {
-            let needsBuild = loadedChunks[coord] == nil
+            let needsBuild = !loadedChunkCoords.contains(coord)
                 || neighbors(of: coord).contains(where: newlyCreated.contains)
             if needsBuild {
-                loadedChunks[coord] = buildChunkMesh(at: coord)
+                rebuildChunkMesh(at: coord)
             }
         }
 
@@ -163,6 +166,7 @@ class World {
         for coord in Array(loadedChunks.keys) where !needed.contains(coord) {
             loadedChunks.removeValue(forKey: coord)
         }
+        loadedChunkCoords = needed
     }
 
     /// 水平方向上相邻的 4 个区块（当前区块高度即世界高度，暂无垂直邻居）
@@ -198,6 +202,15 @@ class World {
         return ChunkMesh(buffer: buffer, vertexCount: vertices.count)
     }
 
+    /// 重建已加载区块的 GPU 网格。区块被完全挖空时移除旧网格，但保留加载状态。
+    private func rebuildChunkMesh(at coord: ChunkCoord) {
+        if let mesh = buildChunkMesh(at: coord) {
+            loadedChunks[coord] = mesh
+        } else {
+            loadedChunks.removeValue(forKey: coord)
+        }
+    }
+
     /// 查询世界方块坐标处的方块（可跨区块）。
     /// 所在区块尚未生成、或超出垂直范围时返回 nil（网格生成按空气处理、显示该面）。
     func blockAtWorld(x: Int, y: Int, z: Int) -> BlockType? {
@@ -211,6 +224,48 @@ class World {
         let lx = x - cx * Chunk.width
         let lz = z - cz * Chunk.depth
         return chunk.map[lx][y][lz]
+    }
+
+    /// 将指定世界坐标的方块设为空气，并重建所有受影响的已加载网格。
+    /// 方块修改写入 chunkData，区块离开渲染距离后仍会保留。
+    @discardableResult
+    func removeBlock(at block: BlockCoord) -> Bool {
+        guard block.y >= 0, block.y < Chunk.height else { return false }
+
+        let chunkX = Int(floor(Double(block.x) / Double(Chunk.width)))
+        let chunkZ = Int(floor(Double(block.z) / Double(Chunk.depth)))
+        let chunkCoord = ChunkCoord(x: chunkX, z: chunkZ)
+        guard var chunk = chunkData[chunkCoord] else { return false }
+
+        let localX = block.x - chunkX * Chunk.width
+        let localZ = block.z - chunkZ * Chunk.depth
+        guard chunk.map[localX][block.y][localZ] != .air else { return false }
+
+        chunk.map[localX][block.y][localZ] = .air
+        chunkData[chunkCoord] = chunk
+
+        if loadedChunkCoords.contains(chunkCoord) {
+            rebuildChunkMesh(at: chunkCoord)
+        }
+
+        // 边界方块消失后，相邻区块原本被遮挡的面也需要出现。
+        var affectedNeighbors: [ChunkCoord] = []
+        if localX == 0 {
+            affectedNeighbors.append(ChunkCoord(x: chunkX - 1, z: chunkZ))
+        }
+        if localX == Chunk.width - 1 {
+            affectedNeighbors.append(ChunkCoord(x: chunkX + 1, z: chunkZ))
+        }
+        if localZ == 0 {
+            affectedNeighbors.append(ChunkCoord(x: chunkX, z: chunkZ - 1))
+        }
+        if localZ == Chunk.depth - 1 {
+            affectedNeighbors.append(ChunkCoord(x: chunkX, z: chunkZ + 1))
+        }
+        for neighbor in affectedNeighbors where loadedChunkCoords.contains(neighbor) {
+            rebuildChunkMesh(at: neighbor)
+        }
+        return true
     }
 
     /// 从世界坐标中的射线寻找第一个非空气方块。
