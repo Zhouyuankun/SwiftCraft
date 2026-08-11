@@ -66,6 +66,13 @@ struct ChunkCoord: Hashable {
     var z: Int
 }
 
+/// 世界中的整数方块坐标，对应方块 AABB 的最小角。
+struct BlockCoord: Equatable {
+    var x: Int
+    var y: Int
+    var z: Int
+}
+
 // MARK: - 单个区块的可渲染数据
 
 /// 一个已上传到 GPU 的区块网格
@@ -193,7 +200,7 @@ class World {
 
     /// 查询世界方块坐标处的方块（可跨区块）。
     /// 所在区块尚未生成、或超出垂直范围时返回 nil（网格生成按空气处理、显示该面）。
-    private func blockAtWorld(x: Int, y: Int, z: Int) -> BlockType? {
+    func blockAtWorld(x: Int, y: Int, z: Int) -> BlockType? {
         guard y >= 0, y < Chunk.height else { return nil }
 
         // 向下取整除法，正确处理负坐标
@@ -204,6 +211,58 @@ class World {
         let lx = x - cx * Chunk.width
         let lz = z - cz * Chunk.depth
         return chunk.map[lx][y][lz]
+    }
+
+    /// 从世界坐标中的射线寻找第一个非空气方块。
+    /// 使用 3D DDA 逐格穿过体素，不依赖 Chunk 的具体地形生成方式。
+    func raycast(origin: simd_float3, direction: simd_float3, maxDistance: Float) -> BlockCoord? {
+        let ray = simd_normalize(direction)
+        guard ray.x.isFinite, ray.y.isFinite, ray.z.isFinite else { return nil }
+
+        var voxel = BlockCoord(
+            x: Int(floor(origin.x)),
+            y: Int(floor(origin.y)),
+            z: Int(floor(origin.z))
+        )
+
+        let stepX = ray.x >= 0 ? 1 : -1
+        let stepY = ray.y >= 0 ? 1 : -1
+        let stepZ = ray.z >= 0 ? 1 : -1
+
+        let deltaX = ray.x == 0 ? Float.infinity : abs(1 / ray.x)
+        let deltaY = ray.y == 0 ? Float.infinity : abs(1 / ray.y)
+        let deltaZ = ray.z == 0 ? Float.infinity : abs(1 / ray.z)
+
+        var nextX = ray.x == 0 ? Float.infinity : distanceToBoundary(origin.x, voxel.x, stepX) * deltaX
+        var nextY = ray.y == 0 ? Float.infinity : distanceToBoundary(origin.y, voxel.y, stepY) * deltaY
+        var nextZ = ray.z == 0 ? Float.infinity : distanceToBoundary(origin.z, voxel.z, stepZ) * deltaZ
+        var distance: Float = 0
+
+        while distance <= maxDistance {
+            if let block = blockAtWorld(x: voxel.x, y: voxel.y, z: voxel.z), block != .air {
+                return voxel
+            }
+
+            if nextX <= nextY && nextX <= nextZ {
+                voxel.x += stepX
+                distance = nextX
+                nextX += deltaX
+            } else if nextY <= nextZ {
+                voxel.y += stepY
+                distance = nextY
+                nextY += deltaY
+            } else {
+                voxel.z += stepZ
+                distance = nextZ
+                nextZ += deltaZ
+            }
+        }
+        return nil
+    }
+
+    private func distanceToBoundary(_ origin: Float, _ voxel: Int, _ step: Int) -> Float {
+        let boundary = step > 0 ? Float(voxel + 1) : Float(voxel)
+        return abs(boundary - origin)
     }
 }
 

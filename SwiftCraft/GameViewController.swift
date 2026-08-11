@@ -48,6 +48,7 @@ class GameViewController: NSViewController {
 
         // 4. 初始化屏幕右上角的坐标 HUD
         setupHUD()
+        setupCrosshair()
 
         // 5. 监听鼠标点击以锁定光标
         NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
@@ -196,6 +197,37 @@ class GameViewController: NSViewController {
         label.alignment = .right
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
+    }
+
+    /// 在视图正中央绘制固定十字准心，不参与鼠标事件。
+    private func setupCrosshair() {
+        let horizontal = makeCrosshairBar()
+        let vertical = makeCrosshairBar()
+        view.addSubview(horizontal)
+        view.addSubview(vertical)
+
+        NSLayoutConstraint.activate([
+            horizontal.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            horizontal.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            horizontal.widthAnchor.constraint(equalToConstant: 16),
+            horizontal.heightAnchor.constraint(equalToConstant: 2),
+
+            vertical.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            vertical.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            vertical.widthAnchor.constraint(equalToConstant: 2),
+            vertical.heightAnchor.constraint(equalToConstant: 16)
+        ])
+    }
+
+    private func makeCrosshairBar() -> NSView {
+        let bar = NSView()
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.9).cgColor
+        bar.layer?.shadowColor = NSColor.black.cgColor
+        bar.layer?.shadowOpacity = 0.8
+        bar.layer?.shadowRadius = 1
+        return bar
     }
 
     func updateHUD() {

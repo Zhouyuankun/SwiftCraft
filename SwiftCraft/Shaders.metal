@@ -9,6 +9,7 @@ struct VertexIn {
 struct VertexOut {
     float4 position [[position]];
     float2 texCoord;
+    float3 worldPosition;
 };
 
 struct Uniforms {
@@ -21,15 +22,29 @@ vertex VertexOut vertex_main(constant VertexIn *vertices [[buffer(0)]],
     VertexOut out;
     out.position = uniforms.mvp * float4(vertices[vid].position, 1.0);
     out.texCoord = vertices[vid].texCoord;
+    out.worldPosition = vertices[vid].position;
     return out;
 }
 
+struct HighlightUniforms {
+    float4 blockMin;
+    float4 blockMax;
+};
+
 fragment float4 fragment_main(VertexOut in [[stage_in]],
-                               texture2d<float> tex [[texture(0)]]) {
+                               texture2d<float> tex [[texture(0)]],
+                               constant HighlightUniforms &highlight [[buffer(1)]]) {
     // 关键：开启 Nearest 采样，保持像素颗粒感，不模糊
     sampler textureSampler(mag_filter::nearest, min_filter::nearest);
 
     float4 color = tex.sample(textureSampler, in.texCoord);
+
+    // 顶点已经位于世界坐标中。若片元落在选中方块的 AABB 内，叠加偏白色。
+    if (highlight.blockMin.w > 0.5 &&
+        all(in.worldPosition >= highlight.blockMin.xyz - 0.001) &&
+        all(in.worldPosition <= highlight.blockMax.xyz + 0.001)) {
+        color.rgb = mix(color.rgb, float3(1.0), 0.38);
+    }
 
     return color;
 }

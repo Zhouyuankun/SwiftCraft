@@ -16,6 +16,12 @@ struct Uniforms {
     var modelViewProjectionMatrix: simd_float4x4
 }
 
+// 当前被准心选中的方块范围。w 为 1 时启用高亮，为 0 时禁用。
+struct HighlightUniforms {
+    var blockMin: simd_float4
+    var blockMax: simd_float4
+}
+
 // 天空渐变着色器的 Uniform（与 Shaders.metal 中的 SkyUniforms 内存布局一致）
 struct SkyUniforms {
     var invViewProj: simd_float4x4 // 视图投影矩阵的逆矩阵

@@ -122,6 +122,13 @@ class Renderer: NSObject, MTKViewDelegate {
         let centerChunk = World.worldToChunkCoord(currentCamera.position)
         world.update(center: centerChunk)
 
+        // 从屏幕中心（相机前向）选取 6 格内的第一个实心方块。
+        let targetedBlock = world.raycast(
+            origin: currentCamera.position,
+            direction: currentCamera.lookAt,
+            maxDistance: 6
+        )
+
         // 合并 VP 矩阵（区块顶点已是世界坐标，模型矩阵为单位阵）
         var uniforms = Uniforms(modelViewProjectionMatrix: projectionMatrix * viewMatrix)
 
@@ -134,6 +141,21 @@ class Renderer: NSObject, MTKViewDelegate {
 
         renderEncoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
         renderEncoder.setFragmentTexture(atlasTexture, index: 0)
+
+        var highlightUniforms: HighlightUniforms
+        if let target = targetedBlock {
+            highlightUniforms = HighlightUniforms(
+                blockMin: simd_float4(Float(target.x), Float(target.y), Float(target.z), 1),
+                blockMax: simd_float4(Float(target.x + 1), Float(target.y + 1), Float(target.z + 1), 1)
+            )
+        } else {
+            highlightUniforms = HighlightUniforms(blockMin: .zero, blockMax: .zero)
+        }
+        renderEncoder.setFragmentBytes(
+            &highlightUniforms,
+            length: MemoryLayout<HighlightUniforms>.stride,
+            index: 1
+        )
 
         // 逐个绘制所有已加载的区块
         for (_, mesh) in world.loadedChunks {
