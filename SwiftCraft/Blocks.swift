@@ -18,27 +18,41 @@ enum BlockType: Int {
     case stone = 1
     case dirt = 2
     case grass = 3
+    case coalOre = 4
+    case planks = 5
+    case log = 6
+    case cobblestone = 7
+    case bedrock = 8
+    case sand = 9
+    case bricks = 10
+    case furnace = 11
+    case litFurnace = 12
 }
 
 struct Chunk {
     static let width = 5
-    static let height = 5
+    static let height = 8
     static let depth = 5
 
     // 存储地形数据
     var map: [[[BlockType]]] = Array(repeating: Array(repeating: Array(repeating: .air, count: depth), count: height), count: width)
 
     init() {
-        // 生成 5*5*5 地形
+        // 生成固定的 8 层平坦地形：1 层基岩、3 层石头、3 层泥土、1 层草方块
         for x in 0..<Chunk.width {
             for z in 0..<Chunk.depth {
                 for y in 0..<Chunk.height {
-                    if y == 4 {
-                        map[x][y][z] = .grass // 最上层草
-                    } else if y == 0 {
-                        map[x][y][z] = .stone // 最下层石
-                    } else {
-                        map[x][y][z] = .dirt  // 中间泥土
+                    switch y {
+                    case 0:
+                        map[x][y][z] = .bedrock
+                    case 1...3:
+                        map[x][y][z] = .stone
+                    case 4...6:
+                        map[x][y][z] = .dirt
+                    case 7:
+                        map[x][y][z] = .grass
+                    default:
+                        break
                     }
                 }
             }
@@ -335,6 +349,11 @@ extension GeometryFactory {
 }
 
 extension BlockType {
+    // terrain_atlas 是 4x4 图集，按从上到下、从左到右排列：
+    // 第 0 行：石头、泥土、草侧面、煤矿石
+    // 第 1 行：木板、原木侧面、原木端面、草顶部
+    // 第 2 行：圆石、基岩、沙子、红砖块
+    // 第 3 行：熄灭熔炉正面、熔炉背面/侧面、点燃熔炉正面、熔炉顶面/底面
     // 定义 6 个面的图集坐标：前, 后, 右, 左, 上, 下
     var faceCoords: [BlockUV] {
         switch self {
@@ -343,15 +362,46 @@ extension BlockType {
             let top = BlockUV(row: 1, col: 3)
             let bottom = BlockUV(row: 0, col: 1)
             return [side, side, side, side, top, bottom]
-            
+
         case .dirt:
             let dirt = BlockUV(row: 0, col: 1)
             return Array(repeating: dirt, count: 6)
-            
+
         case .stone:
             let stone = BlockUV(row: 0, col: 0)
             return Array(repeating: stone, count: 6)
-            
+
+        case .coalOre:
+            return Array(repeating: BlockUV(row: 0, col: 3), count: 6)
+
+        case .planks:
+            return Array(repeating: BlockUV(row: 1, col: 0), count: 6)
+
+        case .log:
+            let side = BlockUV(row: 1, col: 1)
+            let end = BlockUV(row: 1, col: 2)
+            return [side, side, side, side, end, end]
+
+        case .cobblestone:
+            return Array(repeating: BlockUV(row: 2, col: 0), count: 6)
+
+        case .bedrock:
+            return Array(repeating: BlockUV(row: 2, col: 1), count: 6)
+
+        case .sand:
+            return Array(repeating: BlockUV(row: 2, col: 2), count: 6)
+
+        case .bricks:
+            return Array(repeating: BlockUV(row: 2, col: 3), count: 6)
+
+        case .furnace, .litFurnace:
+            let front = self == .litFurnace
+                ? BlockUV(row: 3, col: 2)
+                : BlockUV(row: 3, col: 0)
+            let backAndSides = BlockUV(row: 3, col: 1)
+            let topAndBottom = BlockUV(row: 3, col: 3)
+            return [front, backAndSides, backAndSides, backAndSides, topAndBottom, topAndBottom]
+
         case .air:
             // 空气不需要坐标，返回空或默认值即可（逻辑上 generateChunkMesh 会跳过 air）
             return Array(repeating: BlockUV(row: 0, col: 0), count: 6)

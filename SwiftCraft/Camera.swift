@@ -8,8 +8,8 @@
 import simd
 
 class Camera {
-    // 初始位置：区块 (0,0) 的中心上方（地形顶部 y=5，这里稍高便于观察）
-    var position = simd_float3(2.5, 7.0, 2.5)
+    // 初始位置：区块 (0,0) 的中心上方（方块顶面位于 y=8）
+    var position = simd_float3(2.5, 10.0, 2.5)
     var yaw: Float = -90.0  // 水平旋转（-90 表示面向 -z 方向）
     var pitch: Float = 0.0  // 垂直旋转
     
