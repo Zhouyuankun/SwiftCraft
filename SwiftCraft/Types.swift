@@ -9,7 +9,9 @@ import simd
 
 struct Vertex {
     var position: simd_float3
-    var texCoord: simd_float2 // 必须同步更新，且 Shader 里也要改
+    var texCoord: simd_float2
+    var faceBrightness: Float
+    var textureLayer: UInt32 // 必须与 Shaders.metal 中的 VertexIn 保持一致
 }
 
 struct Uniforms {

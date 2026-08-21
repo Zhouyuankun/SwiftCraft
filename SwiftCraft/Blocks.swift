@@ -96,6 +96,19 @@ struct ChunkPerformanceMetrics {
     }
 }
 
+private struct GeneratedChunkResult {
+    let coord: ChunkCoord
+    let chunk: Chunk
+    let seconds: TimeInterval
+}
+
+private struct GeneratedMeshResult {
+    let coord: ChunkCoord
+    let version: Int
+    let vertices: [Vertex]
+    let seconds: TimeInterval
+}
+
 // MARK: - 多区块世界管理
 //
 // 负责根据玩家所在的区块，动态创建/卸载周围的区块。
@@ -121,6 +134,40 @@ class World {
     /// 当前处于渲染距离内的区块坐标。单个区块即使被挖空、没有网格，也仍算已加载。
     private var loadedChunkCoords: Set<ChunkCoord> = []
 
+    /// 当前 GPU 网格对应的区块版本；空网格也记录版本，避免每帧重复调度。
+    private var loadedMeshVersions: [ChunkCoord: Int] = [:]
+
+    /// 每个区块的数据版本。玩家修改时递增，使旧后台网格结果自动失效。
+    private var chunkVersions: [ChunkCoord: Int] = [:]
+
+    private var requestedDataCoords: Set<ChunkCoord> = []
+    private var meshJobs: [ChunkCoord: Int] = [:]
+
+    private let resultLock = NSLock()
+    private var generatedChunkResults: [GeneratedChunkResult] = []
+    private var generatedMeshResults: [GeneratedMeshResult] = []
+    private var readyMeshResults: [GeneratedMeshResult] = []
+
+    /// 每帧最多把一个完成的 CPU 网格上传为 MTLBuffer，避免结果集中提交。
+    private let maximumMeshUploadsPerFrame = 1
+    private let meshUploadBudgetMilliseconds: Double = 2
+
+    private let dataQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "SwiftCraft.TerrainData"
+        queue.qualityOfService = .userInitiated
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
+
+    private let meshQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "SwiftCraft.MeshVertices"
+        queue.qualityOfService = .userInitiated
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
+
     /// Metal 设备，用于创建顶点缓冲
     private let device: MTLDevice
 
@@ -130,6 +177,8 @@ class World {
     /// 区块方块数据生成与网格构建的累计性能数据。
     private(set) var terrainGenerationPerformance = ChunkPerformanceMetrics()
     private(set) var meshBuildPerformance = ChunkPerformanceMetrics()
+    private(set) var vertexGenerationPerformance = ChunkPerformanceMetrics()
+    private(set) var bufferCreationPerformance = ChunkPerformanceMetrics()
 
     /// 只负责创建原始方块数据，不参与网格构建或加载状态管理。
     private let terrainGenerator: any TerrainGenerating
@@ -157,7 +206,7 @@ class World {
     }
 
     /// 以玩家所在区块为中心，加载渲染距离内的区块，卸载超出的区块。
-    /// 只在区块集合发生变化时才真正做加载/卸载，避免每帧重复工作。
+    /// 每帧先接收后台结果，再按需调度缺失数据和网格任务。
     func update(center: ChunkCoord) {
         var needed = Set<ChunkCoord>()
         let r = World.renderDistance
@@ -169,55 +218,31 @@ class World {
             }
         }
 
-        // 若需要的区块集合和当前已加载的完全一致，直接跳过
-        if needed == loadedChunkCoords {
-            return
-        }
+        let visibleSetChanged = needed != loadedChunkCoords
+        loadedChunkCoords = needed
 
-        let generationCountBefore = terrainGenerationPerformance.sampleCount
-        let generationTimeBefore = terrainGenerationPerformance.totalMilliseconds
-        let meshCountBefore = meshBuildPerformance.sampleCount
-        let meshTimeBefore = meshBuildPerformance.totalMilliseconds
-
-        // 1. 先确保所有需要的区块"数据"存在（数据必须先于网格构建就绪，
-        //    这样构建网格时才能查询到相邻区块、完成跨区块面剔除）。
-        //    记录本次首次生成的区块坐标。
-        var newlyCreated: Set<ChunkCoord> = []
-        for coord in needed where chunkData[coord] == nil {
-            // 首次进入：通过独立生成器创建数据并永久保存，供以后还原。
-            let start = ProcessInfo.processInfo.systemUptime
-            chunkData[coord] = terrainGenerator.generateChunk(at: coord)
-            terrainGenerationPerformance.record(
-                seconds: ProcessInfo.processInfo.systemUptime - start
-            )
-            newlyCreated.insert(coord)
-        }
-
-        // 2. 构建/重建网格：
-        //    - 还没有网格的区块需要构建（新进入渲染距离，或之前被卸载过）
-        //    - 邻居中有"刚生成"的区块时也要重建：之前该侧没有邻居、边界面被保留，
-        //      现在邻居出现了，那些面应当被剔除
-        for coord in needed {
-            let needsBuild = !loadedChunkCoords.contains(coord)
-                || neighbors(of: coord).contains(where: newlyCreated.contains)
-            if needsBuild {
-                rebuildChunkMesh(at: coord)
+        // 超出可见范围时释放 GPU 网格；后台任务可继续完成，但结果会在接收时丢弃。
+        if visibleSetChanged {
+            for coord in Array(loadedChunks.keys) where !needed.contains(coord) {
+                loadedChunks.removeValue(forKey: coord)
+            }
+            for coord in Array(loadedMeshVersions.keys) where !needed.contains(coord) {
+                loadedMeshVersions.removeValue(forKey: coord)
             }
         }
 
-        // 3. 卸载超出渲染距离的区块：只释放 GPU 网格，
-        //    方块数据仍保留在 chunkData 中，下次进入时还原
-        for coord in Array(loadedChunks.keys) where !needed.contains(coord) {
-            loadedChunks.removeValue(forKey: coord)
-        }
-        loadedChunkCoords = needed
+        drainAsyncResults(center: center)
 
-        logUpdatePerformance(
-            generationCountBefore: generationCountBefore,
-            generationTimeBefore: generationTimeBefore,
-            meshCountBefore: meshCountBefore,
-            meshTimeBefore: meshTimeBefore
-        )
+        // 为可见范围及其四侧邻居准备纯数据 halo。
+        var dataNeeded = needed
+        for coord in needed {
+            dataNeeded.formUnion(neighbors(of: coord))
+        }
+        let scheduledData = scheduleMissingData(in: dataNeeded, center: center)
+        let scheduledMeshes = scheduleMissingMeshes(in: needed, center: center)
+        if scheduledData > 0 || scheduledMeshes > 0 {
+            print("Chunk jobs: data \(scheduledData), mesh \(scheduledMeshes)")
+        }
     }
 
     /// 水平方向上相邻的 4 个区块（当前区块高度即世界高度，暂无垂直邻居）
@@ -230,67 +255,183 @@ class World {
         ]
     }
 
-    /// 用已有的区块数据构建网格并上传到 GPU（顶点坐标已转换到世界坐标）
-    private func buildChunkMesh(at coord: ChunkCoord) -> ChunkMesh? {
-        guard let chunk = chunkData[coord] else { return nil }
+    private func scheduleMissingData(in coords: Set<ChunkCoord>, center: ChunkCoord) -> Int {
+        let missing = coords
+            .filter { chunkData[$0] == nil && !requestedDataCoords.contains($0) }
+            .sorted { distanceSquared(from: $0, to: center) < distanceSquared(from: $1, to: center) }
+        guard !missing.isEmpty else { return 0 }
 
-        // 该区块在世界中的原点偏移
-        let origin = WorldCoordinates.worldOrigin(for: coord)
-        // 传入跨区块查询闭包，实现区块间的面剔除
-        let vertices = GeometryFactory.generateChunkMesh(chunk: chunk, worldOrigin: origin) { wx, wy, wz in
-            self.blockAtWorld(x: wx, y: wy, z: wz)
+        let generator = terrainGenerator
+        for coord in missing {
+            requestedDataCoords.insert(coord)
+            dataQueue.addOperation { [weak self] in
+                let start = ProcessInfo.processInfo.systemUptime
+                let chunk = generator.generateChunk(at: coord)
+                let result = GeneratedChunkResult(
+                    coord: coord,
+                    chunk: chunk,
+                    seconds: ProcessInfo.processInfo.systemUptime - start
+                )
+                guard let self else { return }
+                self.resultLock.lock()
+                self.generatedChunkResults.append(result)
+                self.resultLock.unlock()
+            }
         }
-        guard !vertices.isEmpty else { return nil }
-
-        let bufferSize = vertices.count * MemoryLayout<Vertex>.stride
-        guard let buffer = device.makeBuffer(bytes: vertices, length: bufferSize, options: []) else {
-            return nil
-        }
-        return ChunkMesh(buffer: buffer, vertexCount: vertices.count)
+        return missing.count
     }
 
-    /// 重建已加载区块的 GPU 网格。区块被完全挖空时移除旧网格，但保留加载状态。
-    private func rebuildChunkMesh(at coord: ChunkCoord) {
-        let start = ProcessInfo.processInfo.systemUptime
-        defer {
-            meshBuildPerformance.record(
-                seconds: ProcessInfo.processInfo.systemUptime - start
-            )
+    private func scheduleMissingMeshes(in coords: Set<ChunkCoord>, center: ChunkCoord) -> Int {
+        let candidates = coords
+            .filter { coord in
+                guard chunkData[coord] != nil else { return false }
+                let version = chunkVersions[coord, default: 0]
+                return loadedMeshVersions[coord] != version && meshJobs[coord] != version
+            }
+            .sorted { distanceSquared(from: $0, to: center) < distanceSquared(from: $1, to: center) }
+        guard !candidates.isEmpty else { return 0 }
+
+        // 值类型快照通过 Array 的 copy-on-write 与渲染线程隔离。
+        let visibleData = Dictionary(uniqueKeysWithValues: loadedChunkCoords.compactMap { coord in
+            chunkData[coord].map { (coord, $0) }
+        })
+
+        for coord in candidates {
+            guard let chunk = visibleData[coord] else { continue }
+            let version = chunkVersions[coord, default: 0]
+            let origin = WorldCoordinates.worldOrigin(for: coord)
+            meshJobs[coord] = version
+
+            meshQueue.addOperation { [weak self] in
+                let start = ProcessInfo.processInfo.systemUptime
+                let vertices = GeometryFactory.generateChunkMesh(
+                    chunk: chunk,
+                    worldOrigin: origin
+                ) { wx, wy, wz in
+                    guard wy >= 0, wy < Chunk.height else { return nil }
+                    let location = WorldCoordinates.chunkAndLocal(x: wx, z: wz)
+                    guard let neighbor = visibleData[location.coord] else { return nil }
+                    return neighbor[location.localX, wy, location.localZ]
+                }
+                let result = GeneratedMeshResult(
+                    coord: coord,
+                    version: version,
+                    vertices: vertices,
+                    seconds: ProcessInfo.processInfo.systemUptime - start
+                )
+                guard let self else { return }
+                self.resultLock.lock()
+                self.generatedMeshResults.append(result)
+                self.resultLock.unlock()
+            }
         }
-        if let mesh = buildChunkMesh(at: coord) {
-            loadedChunks[coord] = mesh
-        } else {
-            loadedChunks.removeValue(forKey: coord)
+        return candidates.count
+    }
+
+    private func drainAsyncResults(center: ChunkCoord) {
+        resultLock.lock()
+        let dataResults = generatedChunkResults
+        let meshResults = generatedMeshResults
+        generatedChunkResults.removeAll(keepingCapacity: true)
+        generatedMeshResults.removeAll(keepingCapacity: true)
+        resultLock.unlock()
+
+        readyMeshResults.append(contentsOf: meshResults)
+
+        var dataMilliseconds: Double = 0
+        for result in dataResults {
+            requestedDataCoords.remove(result.coord)
+            terrainGenerationPerformance.record(seconds: result.seconds)
+            dataMilliseconds += result.seconds * 1_000
+            if chunkData[result.coord] == nil {
+                chunkData[result.coord] = result.chunk
+                chunkVersions[result.coord] = 0
+            }
+        }
+
+        let vertexMilliseconds = meshResults.reduce(0) { total, result in
+            vertexGenerationPerformance.record(seconds: result.seconds)
+            return total + result.seconds * 1_000
+        }
+        var bufferMilliseconds: Double = 0
+        var appliedMeshes = 0
+        var discardedMeshes = 0
+
+        // 先清除已离开可见范围或版本过期的结果，它们不占上传预算。
+        readyMeshResults.removeAll { result in
+            let isStale = !loadedChunkCoords.contains(result.coord)
+                || chunkVersions[result.coord, default: 0] != result.version
+            guard isStale else { return false }
+            if meshJobs[result.coord] == result.version {
+                meshJobs.removeValue(forKey: result.coord)
+            }
+            discardedMeshes += 1
+            return true
+        }
+
+        let uploadStart = ProcessInfo.processInfo.systemUptime
+        while appliedMeshes < maximumMeshUploadsPerFrame, !readyMeshResults.isEmpty {
+            let elapsedMilliseconds = (ProcessInfo.processInfo.systemUptime - uploadStart) * 1_000
+            if appliedMeshes > 0 && elapsedMilliseconds >= meshUploadBudgetMilliseconds {
+                break
+            }
+
+            let bestIndex = readyMeshResults.indices.min { lhs, rhs in
+                distanceSquared(from: readyMeshResults[lhs].coord, to: center)
+                    < distanceSquared(from: readyMeshResults[rhs].coord, to: center)
+            }!
+            let result = readyMeshResults.remove(at: bestIndex)
+            if meshJobs[result.coord] == result.version {
+                meshJobs.removeValue(forKey: result.coord)
+            }
+
+            let bufferStart = ProcessInfo.processInfo.systemUptime
+            let buffer: MTLBuffer?
+            if result.vertices.isEmpty {
+                buffer = nil
+            } else {
+                buffer = device.makeBuffer(
+                    bytes: result.vertices,
+                    length: result.vertices.count * MemoryLayout<Vertex>.stride,
+                    options: []
+                )
+            }
+            let bufferSeconds = ProcessInfo.processInfo.systemUptime - bufferStart
+            bufferCreationPerformance.record(seconds: bufferSeconds)
+            meshBuildPerformance.record(seconds: result.seconds + bufferSeconds)
+            bufferMilliseconds += bufferSeconds * 1_000
+
+            if let buffer {
+                loadedChunks[result.coord] = ChunkMesh(
+                    buffer: buffer,
+                    vertexCount: result.vertices.count
+                )
+            } else {
+                loadedChunks.removeValue(forKey: result.coord)
+            }
+            loadedMeshVersions[result.coord] = result.version
+            appliedMeshes += 1
+        }
+
+        if !dataResults.isEmpty || !meshResults.isEmpty || appliedMeshes > 0 || discardedMeshes > 0 {
+            print(String(
+                format: "Async ready: data %d / %.2f ms, mesh arrived %d queued %d applied %d discarded %d / vertices %.2f ms, buffer %.2f ms",
+                dataResults.count,
+                dataMilliseconds,
+                meshResults.count,
+                readyMeshResults.count,
+                appliedMeshes,
+                discardedMeshes,
+                vertexMilliseconds,
+                bufferMilliseconds
+            ))
         }
     }
 
-    private func logUpdatePerformance(
-        generationCountBefore: Int,
-        generationTimeBefore: Double,
-        meshCountBefore: Int,
-        meshTimeBefore: Double
-    ) {
-        let generatedCount = terrainGenerationPerformance.sampleCount - generationCountBefore
-        let generationMilliseconds = terrainGenerationPerformance.totalMilliseconds - generationTimeBefore
-        let builtMeshCount = meshBuildPerformance.sampleCount - meshCountBefore
-        let meshMilliseconds = meshBuildPerformance.totalMilliseconds - meshTimeBefore
-
-        let generationAverage = generatedCount == 0
-            ? 0
-            : generationMilliseconds / Double(generatedCount)
-        let meshAverage = builtMeshCount == 0
-            ? 0
-            : meshMilliseconds / Double(builtMeshCount)
-
-        print(String(
-            format: "Chunk update: data %d / %.2f ms (avg %.2f), mesh %d / %.2f ms (avg %.2f)",
-            generatedCount,
-            generationMilliseconds,
-            generationAverage,
-            builtMeshCount,
-            meshMilliseconds,
-            meshAverage
-        ))
+    private func distanceSquared(from coord: ChunkCoord, to center: ChunkCoord) -> Int {
+        let dx = coord.x - center.x
+        let dz = coord.z - center.z
+        return dx * dx + dz * dz
     }
 
     /// 查询世界方块坐标处的方块（可跨区块）。
@@ -321,7 +462,7 @@ class World {
         chunkData[chunkCoord] = chunk
 
         if loadedChunkCoords.contains(chunkCoord) {
-            rebuildChunkMesh(at: chunkCoord)
+            invalidateMesh(at: chunkCoord)
         }
 
         // 边界方块消失后，相邻区块原本被遮挡的面也需要出现。
@@ -339,9 +480,13 @@ class World {
             affectedNeighbors.append(ChunkCoord(x: chunkCoord.x, z: chunkCoord.z + 1))
         }
         for neighbor in affectedNeighbors where loadedChunkCoords.contains(neighbor) {
-            rebuildChunkMesh(at: neighbor)
+            invalidateMesh(at: neighbor)
         }
         return true
+    }
+
+    private func invalidateMesh(at coord: ChunkCoord) {
+        chunkVersions[coord, default: 0] += 1
     }
 
     /// 从世界坐标中的射线寻找第一个非空气方块。
@@ -400,7 +545,6 @@ class World {
 struct GeometryFactory {
     
     static func createCube(type: BlockType, atlasSize: Int = 4) -> [Vertex] {
-        let step = Float(1.0) / Float(atlasSize)
         let coords = type.faceCoords
         
         var vertices = [Vertex]()
@@ -418,18 +562,17 @@ struct GeometryFactory {
         
         for (i, posArray) in facePositions.enumerated() {
             let coord = coords[i]
-            let u = Float(coord.col) * step
-            let v = Float(coord.row) * step
-            
-            let uvs: [simd_float2] = [
-                [u, v + step],         // 左下
-                [u + step, v + step],  // 右下
-                [u + step, v],         // 右上
-                [u, v]                 // 左上
-            ]
+            let brightness = faceBrightness[i]
+            let uvs = localTileUVs
+            let textureLayer = layerIndex(for: coord, atlasSize: atlasSize)
             
             for j in 0..<4 {
-                vertices.append(Vertex(position: posArray[j], texCoord: uvs[j]))
+                vertices.append(Vertex(
+                    position: posArray[j],
+                    texCoord: uvs[j],
+                    faceBrightness: brightness,
+                    textureLayer: textureLayer
+                ))
             }
         }
         
@@ -451,7 +594,7 @@ extension GeometryFactory {
         blockAtWorld: ((Int, Int, Int) -> BlockType?)? = nil
     ) -> [Vertex] {
         var vertices = [Vertex]()
-        let step = Float(1.0) / 4.0 // 4x4 图集
+        vertices.reserveCapacity(Chunk.width * Chunk.depth * 36)
 
         for x in 0..<Chunk.width {
             for y in 0..<Chunk.height {
@@ -460,17 +603,6 @@ extension GeometryFactory {
                     if type == .air { continue }
 
                     let pos = simd_float3(Float(x), Float(y), Float(z)) + worldOrigin
-                    let coords = type.faceCoords // 之前定义的那个获取 6 个面 UV 的方法
-
-                    // 检查 6 个方向的邻居
-                    let directions: [(dx: Int, dy: Int, dz: Int)] = [
-                        (0, 0, 1),  // 前
-                        (0, 0, -1), // 后
-                        (1, 0, 0),  // 右
-                        (-1, 0, 0), // 左
-                        (0, 1, 0),  // 上
-                        (0, -1, 0)  // 下
-                    ]
 
                     for (i, d) in directions.enumerated() {
                         let nx = x + d.dx
@@ -496,9 +628,12 @@ extension GeometryFactory {
                         }
 
                         if neighbor == .air {
-                            // 只添加这一个面的 4 个顶点
-                            let faceVerts = getFaceVertices(directionIndex: i, position: pos, uvCoord: coords[i], step: step)
-                            vertices.append(contentsOf: faceVerts)
+                            appendFace(
+                                to: &vertices,
+                                directionIndex: i,
+                                position: pos,
+                                uvCoord: type.faceCoord(directionIndex: i)
+                            )
                         }
                     }
                 }
@@ -507,34 +642,59 @@ extension GeometryFactory {
         return vertices
     }
     
-    // 辅助方法：生成单个面的 4 个顶点
-    private static func getFaceVertices(directionIndex: Int, position: simd_float3, uvCoord: BlockUV, step: Float) -> [Vertex] {
-        let u = Float(uvCoord.col) * step
-        let v = Float(uvCoord.row) * step
-        
-        // UV 坐标：左下, 右下, 右上, 左上
-        let uvs: [simd_float2] = [
-            [u, v + step],
-            [u + step, v + step],
-            [u + step, v],
-            [u, v]
-        ]
-        
-        let allFacePositions: [[simd_float3]] = [
-            [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]], // 前 (z+)
-            [[1, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]], // 后 (z-)
-            [[1, 0, 1], [1, 0, 0], [1, 1, 0], [1, 1, 1]], // 右 (x+)
-            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]], // 左 (x-)
-            [[0, 1, 1], [1, 1, 1], [1, 1, 0], [0, 1, 0]], // 上 (y+)
-            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]]  // 下 (y-)
-        ]
-        
-        // 关键点：将 4 个点转为 6 个点以适配 .triangle 绘制
-        let triangleIndices = [0, 1, 2, 0, 2, 3]
-        return triangleIndices.map { i in
-            Vertex(position: allFacePositions[directionIndex][i] + position,
-                   texCoord: uvs[i])
+    /// 直接向最终数组写入两个三角形，避免为每个可见面创建临时数组。
+    private static func appendFace(
+        to vertices: inout [Vertex],
+        directionIndex: Int,
+        position: simd_float3,
+        uvCoord: BlockUV
+    ) {
+        let textureLayer = layerIndex(for: uvCoord, atlasSize: 4)
+        let positions = facePositions[directionIndex]
+        let brightness = faceBrightness[directionIndex]
+        for vertexIndex in triangleIndices {
+            vertices.append(Vertex(
+                position: positions[vertexIndex] + position,
+                texCoord: localTileUVs[vertexIndex],
+                faceBrightness: brightness,
+                textureLayer: textureLayer
+            ))
         }
+    }
+
+    private static let directions: [(dx: Int, dy: Int, dz: Int)] = [
+        (0, 0, 1),
+        (0, 0, -1),
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0)
+    ]
+
+    private static let facePositions: [[simd_float3]] = [
+        [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
+        [[1, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]],
+        [[1, 0, 1], [1, 0, 0], [1, 1, 0], [1, 1, 1]],
+        [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+        [[0, 1, 1], [1, 1, 1], [1, 1, 0], [0, 1, 0]],
+        [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]]
+    ]
+
+    private static let triangleIndices = [0, 1, 2, 0, 2, 3]
+
+    /// 前、后、右、左、上、下六个方向的固定亮度，模拟体素游戏常见的环境面光。
+    private static let faceBrightness: [Float] = [0.84, 0.84, 0.72, 0.72, 1.0, 0.55]
+
+    /// 每个数组切片是 16×16 像素；缩进半个纹素，避免落在采样边界。
+    private static let localTileUVs: [simd_float2] = {
+        let inset = Float(0.5 / 16.0)
+        let low = inset
+        let high = 1 - inset
+        return [[low, high], [high, high], [high, low], [low, low]]
+    }()
+
+    private static func layerIndex(for coord: BlockUV, atlasSize: Int) -> UInt32 {
+        UInt32(coord.row * atlasSize + coord.col)
     }
 }
 
@@ -546,55 +706,57 @@ extension BlockType {
     // 第 3 行：熄灭熔炉正面、熔炉背面/侧面、点燃熔炉正面、熔炉顶面/底面
     // 定义 6 个面的图集坐标：前, 后, 右, 左, 上, 下
     var faceCoords: [BlockUV] {
+        (0..<6).map { faceCoord(directionIndex: $0) }
+    }
+
+    /// 按单个面查询纹理，避免网格热路径为每个方块分配 6 元素数组。
+    func faceCoord(directionIndex: Int) -> BlockUV {
         switch self {
         case .grass:
-            let side = BlockUV(row: 0, col: 2)
-            let top = BlockUV(row: 1, col: 3)
-            let bottom = BlockUV(row: 0, col: 1)
-            return [side, side, side, side, top, bottom]
+            if directionIndex == 4 { return BlockUV(row: 1, col: 3) }
+            if directionIndex == 5 { return BlockUV(row: 0, col: 1) }
+            return BlockUV(row: 0, col: 2)
 
         case .dirt:
-            let dirt = BlockUV(row: 0, col: 1)
-            return Array(repeating: dirt, count: 6)
+            return BlockUV(row: 0, col: 1)
 
         case .stone:
-            let stone = BlockUV(row: 0, col: 0)
-            return Array(repeating: stone, count: 6)
+            return BlockUV(row: 0, col: 0)
 
         case .coalOre:
-            return Array(repeating: BlockUV(row: 0, col: 3), count: 6)
+            return BlockUV(row: 0, col: 3)
 
         case .planks:
-            return Array(repeating: BlockUV(row: 1, col: 0), count: 6)
+            return BlockUV(row: 1, col: 0)
 
         case .log:
-            let side = BlockUV(row: 1, col: 1)
-            let end = BlockUV(row: 1, col: 2)
-            return [side, side, side, side, end, end]
+            return directionIndex >= 4
+                ? BlockUV(row: 1, col: 2)
+                : BlockUV(row: 1, col: 1)
 
         case .cobblestone:
-            return Array(repeating: BlockUV(row: 2, col: 0), count: 6)
+            return BlockUV(row: 2, col: 0)
 
         case .bedrock:
-            return Array(repeating: BlockUV(row: 2, col: 1), count: 6)
+            return BlockUV(row: 2, col: 1)
 
         case .sand:
-            return Array(repeating: BlockUV(row: 2, col: 2), count: 6)
+            return BlockUV(row: 2, col: 2)
 
         case .bricks:
-            return Array(repeating: BlockUV(row: 2, col: 3), count: 6)
+            return BlockUV(row: 2, col: 3)
 
         case .furnace, .litFurnace:
-            let front = self == .litFurnace
-                ? BlockUV(row: 3, col: 2)
-                : BlockUV(row: 3, col: 0)
-            let backAndSides = BlockUV(row: 3, col: 1)
-            let topAndBottom = BlockUV(row: 3, col: 3)
-            return [front, backAndSides, backAndSides, backAndSides, topAndBottom, topAndBottom]
+            if directionIndex == 0 {
+                return self == .litFurnace
+                    ? BlockUV(row: 3, col: 2)
+                    : BlockUV(row: 3, col: 0)
+            }
+            if directionIndex >= 4 { return BlockUV(row: 3, col: 3) }
+            return BlockUV(row: 3, col: 1)
 
         case .air:
-            // 空气不需要坐标，返回空或默认值即可（逻辑上 generateChunkMesh 会跳过 air）
-            return Array(repeating: BlockUV(row: 0, col: 0), count: 6)
+            return BlockUV(row: 0, col: 0)
         }
     }
 }

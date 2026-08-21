@@ -3,13 +3,17 @@ using namespace metal;
 
 struct VertexIn {
     float3 position;
-    float2 texCoord; // 必须匹配 Swift 中的顺序
+    float2 texCoord;
+    float faceBrightness;
+    uint textureLayer; // 必须匹配 Swift Vertex 的字段顺序
 };
 
 struct VertexOut {
     float4 position [[position]];
     float2 texCoord;
     float3 worldPosition;
+    float faceBrightness;
+    uint textureLayer [[flat]];
 };
 
 struct Uniforms {
@@ -23,6 +27,8 @@ vertex VertexOut vertex_main(constant VertexIn *vertices [[buffer(0)]],
     out.position = uniforms.mvp * float4(vertices[vid].position, 1.0);
     out.texCoord = vertices[vid].texCoord;
     out.worldPosition = vertices[vid].position;
+    out.faceBrightness = vertices[vid].faceBrightness;
+    out.textureLayer = vertices[vid].textureLayer;
     return out;
 }
 
@@ -32,12 +38,19 @@ struct HighlightUniforms {
 };
 
 fragment float4 fragment_main(VertexOut in [[stage_in]],
-                               texture2d<float> tex [[texture(0)]],
+                               texture2d_array<float> tex [[texture(0)]],
                                constant HighlightUniforms &highlight [[buffer(1)]]) {
-    // 关键：开启 Nearest 采样，保持像素颗粒感，不模糊
-    sampler textureSampler(mag_filter::nearest, min_filter::nearest);
+    // 每个材质位于独立数组切片中，mip 层不会混入相邻图块。
+    sampler textureSampler(
+        mag_filter::nearest,
+        min_filter::nearest,
+        mip_filter::nearest,
+        s_address::clamp_to_edge,
+        t_address::clamp_to_edge
+    );
 
-    float4 color = tex.sample(textureSampler, in.texCoord);
+    float4 color = tex.sample(textureSampler, in.texCoord, in.textureLayer);
+    color.rgb *= in.faceBrightness;
 
     // 顶点已经位于世界坐标中。若片元落在选中方块的 AABB 内，叠加偏白色。
     if (highlight.blockMin.w > 0.5 &&

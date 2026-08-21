@@ -1,3 +1,4 @@
+import Foundation
 import MetalKit
 import simd
 
@@ -12,7 +13,7 @@ class Renderer: NSObject, MTKViewDelegate {
     let skyPipelineState: MTLRenderPipelineState
     let skyDepthStencilState: MTLDepthStencilState
     
-    // 纹理图集
+    // 从 4×4 图集拆分得到的 16 层纹理数组，每层拥有独立 mipmap。
     let atlasTexture: MTLTexture
     
     // 摄像机引用
@@ -28,6 +29,12 @@ class Renderer: NSObject, MTKViewDelegate {
     // 多区块世界：负责区块的动态加载/卸载
     let world: World
 
+    private var frameWindowSampleCount = 0
+    private var frameWindowTotalMilliseconds: Double = 0
+    private var frameWindowMaximumMilliseconds: Double = 0
+    private var frameWindowOverBudgetCount = 0
+    private var frameWindowSevereSpikeCount = 0
+
     init?(metalKitView: MTKView) {
         guard let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue() else { return nil }
@@ -40,19 +47,77 @@ class Renderer: NSObject, MTKViewDelegate {
         // 天空蓝背景
         metalKitView.clearColor = MTLClearColor(red: 0.5, green: 0.8, blue: 1.0, alpha: 1.0)
 
-        // 1. 加载图集
+        // 1. 加载图集原图，再拆为独立切片，防止 mipmap 混合相邻材质。
         let textureLoader = MTKTextureLoader(device: device)
+        let sourceAtlas: MTLTexture
         do {
             let options: [MTKTextureLoader.Option: Any] = [
                 .SRGB: false,
-                .generateMipmaps: true // 生成多级渐远纹理，远处不闪烁
+                .generateMipmaps: false
             ]
-            // 请确保 Assets 中有名为 "terrain_atlas" 的图片
-            atlasTexture = try textureLoader.newTexture(name: "terrain_atlas", scaleFactor: 1.0, bundle: nil, options: options)
+            sourceAtlas = try textureLoader.newTexture(
+                name: "terrain_atlas",
+                scaleFactor: 1.0,
+                bundle: nil,
+                options: options
+            )
         } catch {
             print("图集加载失败: \(error)")
             return nil
         }
+
+        let atlasGridSize = 4
+        guard sourceAtlas.width % atlasGridSize == 0,
+              sourceAtlas.height % atlasGridSize == 0 else {
+            print("图集尺寸必须能被 4×4 网格整除")
+            return nil
+        }
+        let tileWidth = sourceAtlas.width / atlasGridSize
+        let tileHeight = sourceAtlas.height / atlasGridSize
+        let arrayDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: sourceAtlas.pixelFormat,
+            width: tileWidth,
+            height: tileHeight,
+            mipmapped: true
+        )
+        arrayDescriptor.textureType = .type2DArray
+        arrayDescriptor.arrayLength = atlasGridSize * atlasGridSize
+        arrayDescriptor.storageMode = .private
+        arrayDescriptor.usage = .shaderRead
+
+        guard let textureArray = device.makeTexture(descriptor: arrayDescriptor),
+              let textureCommandBuffer = commandQueue.makeCommandBuffer(),
+              let blitEncoder = textureCommandBuffer.makeBlitCommandEncoder() else {
+            print("纹理数组创建失败")
+            return nil
+        }
+        textureArray.label = "Terrain Texture Array"
+
+        for row in 0..<atlasGridSize {
+            for col in 0..<atlasGridSize {
+                let slice = row * atlasGridSize + col
+                blitEncoder.copy(
+                    from: sourceAtlas,
+                    sourceSlice: 0,
+                    sourceLevel: 0,
+                    sourceOrigin: MTLOrigin(x: col * tileWidth, y: row * tileHeight, z: 0),
+                    sourceSize: MTLSize(width: tileWidth, height: tileHeight, depth: 1),
+                    to: textureArray,
+                    destinationSlice: slice,
+                    destinationLevel: 0,
+                    destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+                )
+            }
+        }
+        blitEncoder.generateMipmaps(for: textureArray)
+        blitEncoder.endEncoding()
+        textureCommandBuffer.commit()
+        textureCommandBuffer.waitUntilCompleted()
+        guard textureCommandBuffer.status == .completed else {
+            print("纹理数组 mipmap 生成失败: \(textureCommandBuffer.error?.localizedDescription ?? "未知错误")")
+            return nil
+        }
+        atlasTexture = textureArray
 
         // 2. 配置管线
         let library = device.makeDefaultLibrary()
@@ -89,6 +154,13 @@ class Renderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        let frameStart = ProcessInfo.processInfo.systemUptime
+        defer {
+            recordFrameCPUTime(
+                seconds: ProcessInfo.processInfo.systemUptime - frameStart
+            )
+        }
+
         // --- 核心：每一帧开始渲染前，先执行逻辑更新（处理 WASD/Shift 移动） ---
         onUpdate?()
         
@@ -187,4 +259,28 @@ class Renderer: NSObject, MTKViewDelegate {
     }
     
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+    private func recordFrameCPUTime(seconds: TimeInterval) {
+        let milliseconds = seconds * 1_000
+        frameWindowSampleCount += 1
+        frameWindowTotalMilliseconds += milliseconds
+        frameWindowMaximumMilliseconds = max(frameWindowMaximumMilliseconds, milliseconds)
+        if milliseconds > 16.7 { frameWindowOverBudgetCount += 1 }
+        if milliseconds > 33 { frameWindowSevereSpikeCount += 1 }
+
+        guard frameWindowSampleCount >= 120 else { return }
+        let average = frameWindowTotalMilliseconds / Double(frameWindowSampleCount)
+        print(String(
+            format: "Frame CPU (120): avg %.2f ms, max %.2f ms, >16.7 %d, >33 %d",
+            average,
+            frameWindowMaximumMilliseconds,
+            frameWindowOverBudgetCount,
+            frameWindowSevereSpikeCount
+        ))
+        frameWindowSampleCount = 0
+        frameWindowTotalMilliseconds = 0
+        frameWindowMaximumMilliseconds = 0
+        frameWindowOverBudgetCount = 0
+        frameWindowSevereSpikeCount = 0
+    }
 }
