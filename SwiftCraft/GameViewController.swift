@@ -13,12 +13,57 @@ let kVK_Space: UInt16 = 49
 let kVK_Shift: UInt16 = 56
 let kVK_Escape: UInt16 = 53
 
+/// 带悬停反馈的完全不透明菜单按钮容器。
+final class HoverMenuButton: NSView {
+    var normalColor: NSColor = .clear
+    var hoverColor: NSColor = .clear
+    private var hoverTrackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+        }
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        hoverTrackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        setBackgroundColor(hoverColor)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setBackgroundColor(normalColor)
+    }
+
+    private func setBackgroundColor(_ color: NSColor) {
+        guard let layer else { return }
+        let animation = CABasicAnimation(keyPath: "backgroundColor")
+        animation.fromValue = layer.presentation()?.backgroundColor ?? layer.backgroundColor
+        animation.toValue = color.cgColor
+        animation.duration = 0.16
+        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(animation, forKey: "backgroundColor")
+        layer.backgroundColor = color.cgColor
+    }
+}
+
 class GameViewController: NSViewController {
     var renderer: Renderer?
     var camera = Camera()
 
     // 状态位：控制是否处于“游戏操作模式”
     var isCursorLocked = false
+
+    // Escape 暂停菜单
+    private var pauseOverlay: NSView!
+    private var isPauseMenuVisible = false
 
     // --- HUD：屏幕右上角显示绝对位置、朝向和区块编号 ---
     private var positionLabel: NSTextField!
@@ -50,10 +95,14 @@ class GameViewController: NSViewController {
         // 4. 初始化屏幕右上角的坐标 HUD
         setupHUD()
         setupCrosshair()
+        setupPauseMenu()
 
         // 5. 监听鼠标点击以锁定光标
         NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
             guard let self = self else { return event }
+
+            // 暂停菜单显示时，鼠标点击只交给菜单处理。
+            guard !self.isPauseMenuVisible else { return event }
             
             // 第一次点击进入锁定模式；锁定后的左键用于破坏准心选中的方块。
             let location = event.locationInWindow
@@ -120,7 +169,11 @@ class GameViewController: NSViewController {
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == kVK_Escape {
-            unlockCursor() // 按 ESC 键调用解锁逻辑
+            if isPauseMenuVisible {
+                continueGame()
+            } else {
+                showPauseMenu()
+            }
             return
         }
         
@@ -238,6 +291,135 @@ class GameViewController: NSViewController {
         bar.layer?.shadowOpacity = 0.8
         bar.layer?.shadowRadius = 1
         return bar
+    }
+
+    // MARK: - 暂停菜单
+
+    private func setupPauseMenu() {
+        // 透明蒙层本身不带任何颜色，只轻微模糊背后的游戏画面。
+        let overlay = NSView()
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        overlay.wantsLayer = true
+        overlay.layer?.backgroundColor = NSColor.clear.cgColor
+        // backgroundFilters 即使视图隐藏也可能影响合成，因此只在暂停时动态安装。
+        overlay.layer?.backgroundFilters = nil
+        overlay.isHidden = true
+        pauseOverlay = overlay
+
+        // macOS 26 原生液态玻璃面板。
+        let panel = NSGlassEffectView()
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.style = .regular
+        panel.cornerRadius = 30
+        panel.tintColor = NSColor.black.withAlphaComponent(0.10)
+
+        let panelContent = NSView()
+        panel.contentView = panelContent
+
+        let title = NSTextField(labelWithString: "游戏暂停")
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = NSFont.systemFont(ofSize: 26, weight: .semibold)
+        title.textColor = .black
+        title.alignment = .center
+
+        let continueButton = makePauseButton(title: "继续游戏", action: #selector(continueGame))
+        let quitButton = makePauseButton(
+            title: "退出游戏",
+            action: #selector(quitGame),
+            tintColor: NSColor.systemRed,
+            hoverTintColor: NSColor(calibratedRed: 1.0, green: 0.18, blue: 0.22, alpha: 1.0)
+        )
+
+        view.addSubview(overlay)
+        overlay.addSubview(panel)
+        panelContent.addSubview(title)
+        panelContent.addSubview(continueButton)
+        panelContent.addSubview(quitButton)
+
+        NSLayoutConstraint.activate([
+            overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            overlay.topAnchor.constraint(equalTo: view.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+            panel.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            panel.centerYAnchor.constraint(equalTo: overlay.centerYAnchor),
+            panel.widthAnchor.constraint(equalToConstant: 360),
+            panel.heightAnchor.constraint(equalToConstant: 292),
+
+            title.topAnchor.constraint(equalTo: panelContent.topAnchor, constant: 38),
+            title.leadingAnchor.constraint(equalTo: panelContent.leadingAnchor, constant: 36),
+            title.trailingAnchor.constraint(equalTo: panelContent.trailingAnchor, constant: -36),
+
+            continueButton.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 34),
+            continueButton.leadingAnchor.constraint(equalTo: panelContent.leadingAnchor, constant: 42),
+            continueButton.trailingAnchor.constraint(equalTo: panelContent.trailingAnchor, constant: -42),
+            continueButton.heightAnchor.constraint(equalToConstant: 56),
+
+            quitButton.topAnchor.constraint(equalTo: continueButton.bottomAnchor, constant: 16),
+            quitButton.leadingAnchor.constraint(equalTo: continueButton.leadingAnchor),
+            quitButton.trailingAnchor.constraint(equalTo: continueButton.trailingAnchor),
+            quitButton.heightAnchor.constraint(equalToConstant: 56)
+        ])
+    }
+
+    private func makePauseButton(
+        title: String,
+        action: Selector,
+        tintColor: NSColor = NSColor.controlAccentColor,
+        hoverTintColor: NSColor = NSColor(calibratedRed: 0.08, green: 0.55, blue: 1.0, alpha: 1.0)
+    ) -> HoverMenuButton {
+        let container = HoverMenuButton()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 28
+        container.layer?.cornerCurve = .continuous
+        container.layer?.backgroundColor = tintColor.cgColor
+        container.layer?.shadowColor = NSColor.black.cgColor
+        container.layer?.shadowOpacity = 0.18
+        container.layer?.shadowRadius = 8
+        container.layer?.shadowOffset = CGSize(width: 0, height: -2)
+        container.normalColor = tintColor
+        container.hoverColor = hoverTintColor
+
+        let button = NSButton(title: title, target: self, action: action)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isBordered = false
+        button.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
+        button.contentTintColor = .white
+        button.focusRingType = .none
+        container.addSubview(button)
+        NSLayoutConstraint.activate([
+            button.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            button.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            button.topAnchor.constraint(equalTo: container.topAnchor),
+            button.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+        return container
+    }
+
+    private func showPauseMenu() {
+        guard !isPauseMenuVisible else { return }
+        isPauseMenuVisible = true
+        unlockCursor()
+        if let blur = CIFilter(name: "CIGaussianBlur") {
+            blur.setValue(3.0, forKey: kCIInputRadiusKey)
+            pauseOverlay.layer?.backgroundFilters = [blur]
+        }
+        pauseOverlay.isHidden = false
+        view.window?.makeFirstResponder(self)
+    }
+
+    @objc private func continueGame() {
+        guard isPauseMenuVisible else { return }
+        isPauseMenuVisible = false
+        pauseOverlay.isHidden = true
+        pauseOverlay.layer?.backgroundFilters = nil
+        lockCursor()
+    }
+
+    @objc private func quitGame() {
+        NSApp.terminate(nil)
     }
 
     func updateHUD() {
