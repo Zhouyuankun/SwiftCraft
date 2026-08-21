@@ -5,6 +5,7 @@
 //  Created by 周源坤 on 4/5/26.
 //
 
+import Foundation
 import Metal
 import simd
 
@@ -30,33 +31,29 @@ enum BlockType: Int {
 }
 
 struct Chunk {
-    static let width = 5
-    static let height = 8
-    static let depth = 5
+    static let width = 16
+    static let height = 64
+    static let depth = 16
 
-    // 存储地形数据
-    var map: [[[BlockType]]] = Array(repeating: Array(repeating: Array(repeating: .air, count: depth), count: height), count: width)
+    /// 按 `(y * depth + z) * width + x` 连续存储，避免三维嵌套数组产生大量小数组。
+    private var blocks = Array(
+        repeating: BlockType.air,
+        count: Chunk.width * Chunk.height * Chunk.depth
+    )
 
-    init() {
-        // 生成固定的 8 层平坦地形：1 层基岩、3 层石头、3 层泥土、1 层草方块
-        for x in 0..<Chunk.width {
-            for z in 0..<Chunk.depth {
-                for y in 0..<Chunk.height {
-                    switch y {
-                    case 0:
-                        map[x][y][z] = .bedrock
-                    case 1...3:
-                        map[x][y][z] = .stone
-                    case 4...6:
-                        map[x][y][z] = .dirt
-                    case 7:
-                        map[x][y][z] = .grass
-                    default:
-                        break
-                    }
-                }
-            }
-        }
+    /// 创建全空气数据容器；具体方块内容由 TerrainGenerating 负责填充。
+    init() {}
+
+    private static func index(x: Int, y: Int, z: Int) -> Int {
+        precondition((0..<width).contains(x))
+        precondition((0..<height).contains(y))
+        precondition((0..<depth).contains(z))
+        return (y * depth + z) * width + x
+    }
+
+    subscript(x: Int, y: Int, z: Int) -> BlockType {
+        get { blocks[Self.index(x: x, y: y, z: z)] }
+        set { blocks[Self.index(x: x, y: y, z: z)] = newValue }
     }
 }
 
@@ -79,6 +76,24 @@ struct BlockCoord: Equatable {
 struct ChunkMesh {
     let buffer: MTLBuffer
     let vertexCount: Int
+}
+
+/// 某类区块工作的累计耗时，便于判断后续是否需要异步化。
+struct ChunkPerformanceMetrics {
+    private(set) var sampleCount = 0
+    private(set) var totalMilliseconds: Double = 0
+    private(set) var maximumMilliseconds: Double = 0
+
+    var averageMilliseconds: Double {
+        sampleCount == 0 ? 0 : totalMilliseconds / Double(sampleCount)
+    }
+
+    mutating func record(seconds: TimeInterval) {
+        let milliseconds = seconds * 1_000
+        sampleCount += 1
+        totalMilliseconds += milliseconds
+        maximumMilliseconds = max(maximumMilliseconds, milliseconds)
+    }
 }
 
 // MARK: - 多区块世界管理
@@ -109,16 +124,36 @@ class World {
     /// Metal 设备，用于创建顶点缓冲
     private let device: MTLDevice
 
-    init(device: MTLDevice) {
+    /// 本次运行使用的世界种子；应用重启时会重新随机生成。
+    let seed: UInt64
+
+    /// 区块方块数据生成与网格构建的累计性能数据。
+    private(set) var terrainGenerationPerformance = ChunkPerformanceMetrics()
+    private(set) var meshBuildPerformance = ChunkPerformanceMetrics()
+
+    /// 只负责创建原始方块数据，不参与网格构建或加载状态管理。
+    private let terrainGenerator: any TerrainGenerating
+
+    init(device: MTLDevice, seed: UInt64 = UInt64.random(in: UInt64.min...UInt64.max)) {
         self.device = device
+        self.seed = seed
+        self.terrainGenerator = HeightmapTerrainGenerator(
+            configuration: TerrainConfiguration(seed: seed)
+        )
+
+        // 节点 3 仅输出诊断采样；噪声尚未参与地形生成。
+        let diagnosticNoise = SeededNoise(seed: seed).fBm2D(x: 12.5, z: -8.25)
+        print("World seed: \(seed), noise diagnostic: \(diagnosticNoise)")
     }
 
     /// 将世界坐标（浮点）转换为区块坐标
     static func worldToChunkCoord(_ pos: simd_float3) -> ChunkCoord {
-        // 向下取整，保证负坐标也能正确归入区块
-        let cx = Int(floor(pos.x / Float(Chunk.width)))
-        let cz = Int(floor(pos.z / Float(Chunk.depth)))
-        return ChunkCoord(x: cx, z: cz)
+        WorldCoordinates.chunkCoord(for: pos)
+    }
+
+    /// 查询生成器在指定世界坐标柱上的地表高度。
+    func surfaceHeight(worldX: Int, worldZ: Int) -> Int {
+        terrainGenerator.surfaceHeight(worldX: worldX, worldZ: worldZ)
     }
 
     /// 以玩家所在区块为中心，加载渲染距离内的区块，卸载超出的区块。
@@ -139,13 +174,22 @@ class World {
             return
         }
 
+        let generationCountBefore = terrainGenerationPerformance.sampleCount
+        let generationTimeBefore = terrainGenerationPerformance.totalMilliseconds
+        let meshCountBefore = meshBuildPerformance.sampleCount
+        let meshTimeBefore = meshBuildPerformance.totalMilliseconds
+
         // 1. 先确保所有需要的区块"数据"存在（数据必须先于网格构建就绪，
         //    这样构建网格时才能查询到相邻区块、完成跨区块面剔除）。
         //    记录本次首次生成的区块坐标。
         var newlyCreated: Set<ChunkCoord> = []
         for coord in needed where chunkData[coord] == nil {
-            // 首次进入：生成新区块数据（未来在此接入噪声地形）并永久保存，供以后还原
-            chunkData[coord] = Chunk()
+            // 首次进入：通过独立生成器创建数据并永久保存，供以后还原。
+            let start = ProcessInfo.processInfo.systemUptime
+            chunkData[coord] = terrainGenerator.generateChunk(at: coord)
+            terrainGenerationPerformance.record(
+                seconds: ProcessInfo.processInfo.systemUptime - start
+            )
             newlyCreated.insert(coord)
         }
 
@@ -167,6 +211,13 @@ class World {
             loadedChunks.removeValue(forKey: coord)
         }
         loadedChunkCoords = needed
+
+        logUpdatePerformance(
+            generationCountBefore: generationCountBefore,
+            generationTimeBefore: generationTimeBefore,
+            meshCountBefore: meshCountBefore,
+            meshTimeBefore: meshTimeBefore
+        )
     }
 
     /// 水平方向上相邻的 4 个区块（当前区块高度即世界高度，暂无垂直邻居）
@@ -184,11 +235,7 @@ class World {
         guard let chunk = chunkData[coord] else { return nil }
 
         // 该区块在世界中的原点偏移
-        let origin = simd_float3(
-            Float(coord.x * Chunk.width),
-            0,
-            Float(coord.z * Chunk.depth)
-        )
+        let origin = WorldCoordinates.worldOrigin(for: coord)
         // 传入跨区块查询闭包，实现区块间的面剔除
         let vertices = GeometryFactory.generateChunkMesh(chunk: chunk, worldOrigin: origin) { wx, wy, wz in
             self.blockAtWorld(x: wx, y: wy, z: wz)
@@ -204,6 +251,12 @@ class World {
 
     /// 重建已加载区块的 GPU 网格。区块被完全挖空时移除旧网格，但保留加载状态。
     private func rebuildChunkMesh(at coord: ChunkCoord) {
+        let start = ProcessInfo.processInfo.systemUptime
+        defer {
+            meshBuildPerformance.record(
+                seconds: ProcessInfo.processInfo.systemUptime - start
+            )
+        }
         if let mesh = buildChunkMesh(at: coord) {
             loadedChunks[coord] = mesh
         } else {
@@ -211,19 +264,43 @@ class World {
         }
     }
 
+    private func logUpdatePerformance(
+        generationCountBefore: Int,
+        generationTimeBefore: Double,
+        meshCountBefore: Int,
+        meshTimeBefore: Double
+    ) {
+        let generatedCount = terrainGenerationPerformance.sampleCount - generationCountBefore
+        let generationMilliseconds = terrainGenerationPerformance.totalMilliseconds - generationTimeBefore
+        let builtMeshCount = meshBuildPerformance.sampleCount - meshCountBefore
+        let meshMilliseconds = meshBuildPerformance.totalMilliseconds - meshTimeBefore
+
+        let generationAverage = generatedCount == 0
+            ? 0
+            : generationMilliseconds / Double(generatedCount)
+        let meshAverage = builtMeshCount == 0
+            ? 0
+            : meshMilliseconds / Double(builtMeshCount)
+
+        print(String(
+            format: "Chunk update: data %d / %.2f ms (avg %.2f), mesh %d / %.2f ms (avg %.2f)",
+            generatedCount,
+            generationMilliseconds,
+            generationAverage,
+            builtMeshCount,
+            meshMilliseconds,
+            meshAverage
+        ))
+    }
+
     /// 查询世界方块坐标处的方块（可跨区块）。
     /// 所在区块尚未生成、或超出垂直范围时返回 nil（网格生成按空气处理、显示该面）。
     func blockAtWorld(x: Int, y: Int, z: Int) -> BlockType? {
         guard y >= 0, y < Chunk.height else { return nil }
 
-        // 向下取整除法，正确处理负坐标
-        let cx = Int(floor(Double(x) / Double(Chunk.width)))
-        let cz = Int(floor(Double(z) / Double(Chunk.depth)))
-        guard let chunk = chunkData[ChunkCoord(x: cx, z: cz)] else { return nil }
-
-        let lx = x - cx * Chunk.width
-        let lz = z - cz * Chunk.depth
-        return chunk.map[lx][y][lz]
+        let location = WorldCoordinates.chunkAndLocal(x: x, z: z)
+        guard let chunk = chunkData[location.coord] else { return nil }
+        return chunk[location.localX, y, location.localZ]
     }
 
     /// 将指定世界坐标的方块设为空气，并重建所有受影响的已加载网格。
@@ -232,16 +309,15 @@ class World {
     func removeBlock(at block: BlockCoord) -> Bool {
         guard block.y >= 0, block.y < Chunk.height else { return false }
 
-        let chunkX = Int(floor(Double(block.x) / Double(Chunk.width)))
-        let chunkZ = Int(floor(Double(block.z) / Double(Chunk.depth)))
-        let chunkCoord = ChunkCoord(x: chunkX, z: chunkZ)
+        let location = WorldCoordinates.chunkAndLocal(x: block.x, z: block.z)
+        let chunkCoord = location.coord
         guard var chunk = chunkData[chunkCoord] else { return false }
 
-        let localX = block.x - chunkX * Chunk.width
-        let localZ = block.z - chunkZ * Chunk.depth
-        guard chunk.map[localX][block.y][localZ] != .air else { return false }
+        let localX = location.localX
+        let localZ = location.localZ
+        guard chunk[localX, block.y, localZ] != .air else { return false }
 
-        chunk.map[localX][block.y][localZ] = .air
+        chunk[localX, block.y, localZ] = .air
         chunkData[chunkCoord] = chunk
 
         if loadedChunkCoords.contains(chunkCoord) {
@@ -251,16 +327,16 @@ class World {
         // 边界方块消失后，相邻区块原本被遮挡的面也需要出现。
         var affectedNeighbors: [ChunkCoord] = []
         if localX == 0 {
-            affectedNeighbors.append(ChunkCoord(x: chunkX - 1, z: chunkZ))
+            affectedNeighbors.append(ChunkCoord(x: chunkCoord.x - 1, z: chunkCoord.z))
         }
         if localX == Chunk.width - 1 {
-            affectedNeighbors.append(ChunkCoord(x: chunkX + 1, z: chunkZ))
+            affectedNeighbors.append(ChunkCoord(x: chunkCoord.x + 1, z: chunkCoord.z))
         }
         if localZ == 0 {
-            affectedNeighbors.append(ChunkCoord(x: chunkX, z: chunkZ - 1))
+            affectedNeighbors.append(ChunkCoord(x: chunkCoord.x, z: chunkCoord.z - 1))
         }
         if localZ == Chunk.depth - 1 {
-            affectedNeighbors.append(ChunkCoord(x: chunkX, z: chunkZ + 1))
+            affectedNeighbors.append(ChunkCoord(x: chunkCoord.x, z: chunkCoord.z + 1))
         }
         for neighbor in affectedNeighbors where loadedChunkCoords.contains(neighbor) {
             rebuildChunkMesh(at: neighbor)
@@ -380,7 +456,7 @@ extension GeometryFactory {
         for x in 0..<Chunk.width {
             for y in 0..<Chunk.height {
                 for z in 0..<Chunk.depth {
-                    let type = chunk.map[x][y][z]
+                    let type = chunk[x, y, z]
                     if type == .air { continue }
 
                     let pos = simd_float3(Float(x), Float(y), Float(z)) + worldOrigin
@@ -407,7 +483,7 @@ extension GeometryFactory {
                            ny >= 0, ny < Chunk.height,
                            nz >= 0, nz < Chunk.depth {
                             // 邻居在本区块内
-                            neighbor = chunk.map[nx][ny][nz]
+                            neighbor = chunk[nx, ny, nz]
                         } else if let blockAtWorld = blockAtWorld {
                             // 邻居跨越区块边界：转换为世界坐标查询 World
                             let wx = Int(worldOrigin.x) + nx

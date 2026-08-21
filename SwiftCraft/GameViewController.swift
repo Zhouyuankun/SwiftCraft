@@ -70,6 +70,7 @@ class GameViewController: NSViewController {
     private var facingLabel: NSTextField!
     private var chunkLabel: NSTextField!
     private var blockLabel: NSTextField!
+    private var seedLabel: NSTextField!
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -79,6 +80,13 @@ class GameViewController: NSViewController {
         let newRenderer = Renderer(metalKitView: mtkView)
         self.renderer = newRenderer
         mtkView.delegate = newRenderer
+
+        // 程序化地表高度不固定，出生点始终放在地表上方三格。
+        if let world = newRenderer?.world {
+            let worldX = Int(floor(camera.position.x))
+            let worldZ = Int(floor(camera.position.z))
+            camera.position.y = Float(world.surfaceHeight(worldX: worldX, worldZ: worldZ) + 3)
+        }
         
         // 2. 传递 Camera 引用
         newRenderer?.camera = self.camera
@@ -229,11 +237,13 @@ class GameViewController: NSViewController {
         facingLabel = GameViewController.makeHUDLabel()
         chunkLabel = GameViewController.makeHUDLabel()
         blockLabel = GameViewController.makeHUDLabel()
+        seedLabel = GameViewController.makeHUDLabel()
 
         view.addSubview(positionLabel)
         view.addSubview(facingLabel)
         view.addSubview(chunkLabel)
         view.addSubview(blockLabel)
+        view.addSubview(seedLabel)
 
         NSLayoutConstraint.activate([
             positionLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
@@ -246,7 +256,10 @@ class GameViewController: NSViewController {
             chunkLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
 
             blockLabel.topAnchor.constraint(equalTo: chunkLabel.bottomAnchor, constant: 2),
-            blockLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
+            blockLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+
+            seedLabel.topAnchor.constraint(equalTo: blockLabel.bottomAnchor, constant: 2),
+            seedLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
         ])
     }
 
@@ -431,12 +444,14 @@ class GameViewController: NSViewController {
         let chunkText = "Chunk  (\(chunk.x), \(chunk.z))"
         let targetedBlockType = renderer?.targetedBlockType ?? .air
         let blockText = "Block  \(String(describing: targetedBlockType))"
+        let seedText = "Seed  \(renderer?.world.seed.description ?? "-")"
 
         // 只在内容变化时更新，避免无谓的重绘
         if positionLabel.stringValue != posText { positionLabel.stringValue = posText }
         if facingLabel.stringValue != facingText { facingLabel.stringValue = facingText }
         if chunkLabel.stringValue != chunkText { chunkLabel.stringValue = chunkText }
         if blockLabel.stringValue != blockText { blockLabel.stringValue = blockText }
+        if seedLabel.stringValue != seedText { seedLabel.stringValue = seedText }
     }
 
     /// 计算朝向文本。
